@@ -1,0 +1,36 @@
+common:
+  seed: 42
+  project_name: "semeval-task13-subtaskA"
+  
+data:
+  raw_data_dir: "data/Task_A"
+  data_dir: "data/Task_A_Processed"
+  
+  max_length: 512
+  
+  calc_perplexity: true
+  perplexity_model: "Qwen/Qwen2.5-Coder-1.5B-Instruct" 
+  
+  num_handcrafted_features: 11 
+
+model:
+  base_model: "microsoft/unixcoder-base"
+  num_labels: 2
+  
+  use_lora: false
+  hidden_dropout: 0.2
+  gradient_checkpointing: true
+
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  num_epochs: 10
+  
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  
+  focal_gamma: 2.0
+  use_supcon: true
+  
+  checkpoint_dir: "results/result_TaskA/checkpoints"
+  early_stop_patience: 4
