@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Add the project root to sys.path to resolve 'models' or 'dataset' imports when running on Kaggle
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 import yaml
 import torch
 import logging
@@ -17,9 +22,9 @@ transformers.utils.import_utils.check_torch_load_is_safe = lambda *args, **kwarg
 transformers.modeling_utils.check_torch_load_is_safe = lambda *args, **kwargs: True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from src.src_TaskA.models.model import HybridClassifier
-from src.src_TaskA.dataset.dataset import AgnosticDataset
-from src.src_TaskA.dataset.preprocess_features import AgnosticFeatureExtractor
+from models.model import HybridClassifier
+from dataset.dataset import AgnosticDataset
+from dataset.preprocess_features import AgnosticFeatureExtractor
 
 logging.basicConfig(
     level=logging.INFO,

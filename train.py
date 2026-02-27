@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Add the project root to sys.path to resolve 'models' or 'dataset' imports when running on Kaggle
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 import transformers.utils.import_utils
 import transformers.modeling_utils
 
@@ -22,9 +27,9 @@ from comet_ml import Experiment
 from sklearn.metrics import confusion_matrix
 from pytorch_metric_learning import losses
 
-from src.src_TaskA.models.model import HybridClassifier
-from src.src_TaskA.dataset.dataset import load_data
-from src.src_TaskB.utils.utils import set_seed, evaluate_model
+from models.model import HybridClassifier
+from dataset.dataset import load_data
+from utils.utils import set_seed, evaluate_model
 
 # -----------------------------------------------------------------------------
 # 1. SETUP & UTILS
@@ -140,7 +145,7 @@ if __name__ == "__main__":
     load_dotenv()
     
     parser = argparse.ArgumentParser(description="SemEval Task A - Generalization Training")
-    parser.add_argument("--config", type=str, default="src/src_TaskA/config/config.yaml")
+    parser.add_argument("--config", type=str, default="config/config.yaml")
     args = parser.parse_args()
     
     ConsoleUX.print_banner("SemEval Task 13 - Subtask A [Generalization]")
