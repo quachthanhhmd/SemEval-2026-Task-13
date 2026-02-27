@@ -264,7 +264,7 @@ def process_data_split(input_path: str, output_path: str, extractor: AgnosticFea
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SemEval Task A - Feature Preprocessing")
-    parser.add_argument("--config", type=str, default="src/src_TaskA/config/config.yaml", help="Path to config yaml")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config yaml")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -285,6 +285,18 @@ if __name__ == "__main__":
     # 4. Paths Definitions
     raw_dir = config["data"].get("raw_data_dir", "data/Task_A")
     proc_dir = config["data"].get("data_dir", "data/Task_A_Processed")
+    
+    # Kaggle runtime adaptation
+    kaggle_input = "/kaggle/input"
+    if os.path.exists(kaggle_input):
+        logger.info(f"Kaggle environment detected. Searching for dataset in {kaggle_input}...")
+        for root, dirs, files in os.walk(kaggle_input):
+            if "train_binary.parquet" in files:
+                raw_dir = root
+                logger.info(f"Found dataset directory: {raw_dir}")
+                break
+        proc_dir = "/kaggle/working/data/Task_A_Processed" # Save output to working dir
+
     os.makedirs(proc_dir, exist_ok=True)
 
     # 5. Run Processing

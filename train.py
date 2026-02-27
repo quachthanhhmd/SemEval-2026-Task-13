@@ -164,6 +164,17 @@ if __name__ == "__main__":
     data_cfg = config.get("data", {})
     model_cfg = config.get("model", {})
 
+    # Kaggle runtime adaptation for Processed Data
+    kaggle_working_data = "/kaggle/working/data/Task_A_Processed"
+    if os.path.exists("/kaggle/input") and os.path.exists(kaggle_working_data):
+        logger.info(f"Kaggle env detected. Overriding data_dir to: {kaggle_working_data}")
+        data_cfg["data_dir"] = kaggle_working_data
+        
+    kaggle_working_results = "/kaggle/working/results/result_TaskA/checkpoints"
+    if os.path.exists("/kaggle/working"):
+        logger.info(f"Kaggle env detected. Overriding checkpoint_dir to: {kaggle_working_results}")
+        train_cfg["checkpoint_dir"] = kaggle_working_results
+
     set_seed(common_cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Compute Device: {device}")
