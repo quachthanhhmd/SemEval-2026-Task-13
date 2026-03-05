@@ -301,8 +301,8 @@ if __name__ == "__main__":
     os.makedirs(proc_dir, exist_ok=True)
 
     # 5. Run Processing
-    train_input = os.path.join(raw_dir, "train_binary.parquet") 
-    val_input = os.path.join(raw_dir, "val_binary.parquet")
+    train_input = os.path.join(raw_dir, "train.parquet") 
+    val_input = os.path.join(raw_dir, "validation.parquet")
     
     train_output = os.path.join(proc_dir, "train_processed.parquet")
     val_output = os.path.join(proc_dir, "val_processed.parquet")
