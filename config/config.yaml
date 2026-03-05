@@ -3,8 +3,8 @@ common:
   project_name: "semeval-task13-subtaskA"
   
 data:
-  raw_data_dir: "data/Task_A"
-  data_dir: "data/Task_A_Processed"
+  raw_data_dir: "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A"
+  data_dir: "/kaggle/working/data/SemEval-2026-Task-13/Task_A_Processed"
   
   max_length: 512
   

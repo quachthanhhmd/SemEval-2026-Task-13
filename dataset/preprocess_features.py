@@ -283,8 +283,8 @@ if __name__ == "__main__":
     extractor = AgnosticFeatureExtractor(config, device)
 
     # 4. Paths Definitions
-    raw_dir = config["data"].get("raw_data_dir", "data/Task_A")
-    proc_dir = config["data"].get("data_dir", "data/Task_A_Processed")
+    raw_dir = config["data"].get("raw_data_dir", "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A")
+    proc_dir = config["data"].get("data_dir", "/kaggle/working/data/SemEval-2026-Task-13/Task_A_Processed")
     
     # Kaggle runtime adaptation
     kaggle_input = "/kaggle/input"
@@ -295,7 +295,7 @@ if __name__ == "__main__":
                 raw_dir = root
                 logger.info(f"Found dataset directory: {raw_dir}")
                 break
-        proc_dir = "/kaggle/working/data/Task_A_Processed" # Save output to working dir
+        proc_dir = "/kaggle/working/SemEval-2026-Task-13/data/Task_A_Processed" # Save output to working dir
 
     os.makedirs(proc_dir, exist_ok=True)
 
