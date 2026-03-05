@@ -288,14 +288,15 @@ if __name__ == "__main__":
     
     # Kaggle runtime adaptation
     kaggle_input = "/kaggle/input"
-    if os.path.exists(kaggle_input):
-        logger.info(f"Kaggle environment detected. Searching for dataset in {kaggle_input}...")
-        for root, dirs, files in os.walk(kaggle_input):
-            if "train_binary.parquet" in files:
-                raw_dir = root
-                logger.info(f"Found dataset directory: {raw_dir}")
-                break
-        proc_dir = "/kaggle/working/SemEval-2026-Task-13/data/Task_A_Processed" # Save output to working dir
+    # if os.path.exists(kaggle_input):
+    #     logger.info(f"Kaggle environment detected. Searching for dataset in {kaggle_input}...")
+    #     for root, dirs, files in os.walk(kaggle_input):
+    #         if "train_binary.parquet" in files:
+    #             raw_dir = root
+    #             logger.info(f"Found dataset directory: {raw_dir}")
+    #             break
+    
+    proc_dir = "/kaggle/working/SemEval-2026-Task-13/data/Task_A_Processed" # Save output to working dir
 
     os.makedirs(proc_dir, exist_ok=True)
 
