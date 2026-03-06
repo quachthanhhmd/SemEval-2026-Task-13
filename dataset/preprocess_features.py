@@ -301,14 +301,14 @@ if __name__ == "__main__":
     os.makedirs(proc_dir, exist_ok=True)
 
     # 5. Run Processing
-    train_input = os.path.join(raw_dir, "train.parquet") 
+    # train_input = os.path.join(raw_dir, "train.parquet") 
     val_input = os.path.join(raw_dir, "validation.parquet")
     
-    train_output = os.path.join(proc_dir, "train_processed.parquet")
+    # train_output = os.path.join(proc_dir, "train_processed.parquet")
     val_output = os.path.join(proc_dir, "val_processed.parquet")
 
-    logger.info("--- Starting TRAIN set processing ---")
-    process_data_split(train_input, train_output, extractor)
+    # logger.info("--- Starting TRAIN set processing ---")
+    # process_data_split(train_input, train_output, extractor)
     
     logger.info("--- Starting VAL set processing ---")
     process_data_split(val_input, val_output, extractor)
