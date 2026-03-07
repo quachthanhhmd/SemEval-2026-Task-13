@@ -265,6 +265,10 @@ def process_data_split(input_path: str, output_path: str, extractor: AgnosticFea
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SemEval Task A - Feature Preprocessing")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config yaml")
+    parser.add_argument("--train_input", type=str, default=None, help="Path to raw train parquet")
+    parser.add_argument("--val_input", type=str, default=None, help="Path to raw validation parquet")
+    parser.add_argument("--train_output", type=str, default=None, help="Path to save processed train parquet")
+    parser.add_argument("--val_output", type=str, default=None, help="Path to save processed validation parquet")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -301,11 +305,11 @@ if __name__ == "__main__":
     os.makedirs(proc_dir, exist_ok=True)
 
     # 5. Run Processing
-    train_input = os.path.join(raw_dir, "train.parquet") 
-    val_input = os.path.join(raw_dir, "validation.parquet")
+    train_input = args.train_input if args.train_input else os.path.join(raw_dir, "train.parquet") 
+    val_input = args.val_input if args.val_input else os.path.join(raw_dir, "validation.parquet")
     
-    train_output = os.path.join(proc_dir, "train_processed.parquet")
-    val_output = os.path.join(proc_dir, "val_processed.parquet")
+    train_output = args.train_output if args.train_output else os.path.join(proc_dir, "train_processed.parquet")
+    val_output = args.val_output if args.val_output else os.path.join(proc_dir, "val_processed.parquet")
 
     logger.info("--- Starting TRAIN set processing ---")
     process_data_split(train_input, train_output, extractor)

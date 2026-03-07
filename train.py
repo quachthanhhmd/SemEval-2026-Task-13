@@ -146,6 +146,8 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="SemEval Task A - Generalization Training")
     parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--train_data", type=str, default=None, help="Path to processed train parquet file")
+    parser.add_argument("--val_data", type=str, default=None, help="Path to processed validation parquet file")
     args = parser.parse_args()
     
     ConsoleUX.print_banner("SemEval Task 13 - Subtask A [Generalization]")
@@ -169,6 +171,11 @@ if __name__ == "__main__":
     if os.path.exists("/kaggle/input") and os.path.exists(kaggle_working_data):
         logger.info(f"Kaggle env detected. Overriding data_dir to: {kaggle_working_data}")
         data_cfg["data_dir"] = kaggle_working_data
+        
+    if args.train_data:
+        data_cfg["train_data_path"] = args.train_data
+    if args.val_data:
+        data_cfg["val_data_path"] = args.val_data
         
     kaggle_working_results = "/kaggle/working/results/result_TaskA/checkpoints"
     if os.path.exists("/kaggle/working"):

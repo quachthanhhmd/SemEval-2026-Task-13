@@ -97,11 +97,14 @@ class AgnosticDataset(Dataset):
 
 def load_data(config, tokenizer):
     """Factory function per caricare train e val dataset."""
-    data_dir = config["data"]["data_dir"]
+    data_dir = config["data"].get("data_dir", "")
     
-    logger.info("Loading Parquet files...")
-    train_df = pd.read_parquet(f"{data_dir}/train_processed.parquet")
-    val_df = pd.read_parquet(f"{data_dir}/val_processed.parquet")
+    train_path = config["data"].get("train_data_path", f"{data_dir}/train_processed.parquet")
+    val_path = config["data"].get("val_data_path", f"{data_dir}/val_processed.parquet")
+    
+    logger.info(f"Loading Parquet files: {train_path}, {val_path}")
+    train_df = pd.read_parquet(train_path)
+    val_df = pd.read_parquet(val_path)
     
     train_df = train_df.dropna(subset=['label']).reset_index(drop=True)
     val_df = val_df.dropna(subset=['label']).reset_index(drop=True)
