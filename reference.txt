@@ -1,0 +1,958 @@
+import torch
+from torch import nn
+from transformers import AutoTokenizer, AutoModel
+from torch.utils.data import Dataset, DataLoader
+import torch
+from torch import nn
+from transformers import AutoModel
+
+
+class Detector(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.encoder = AutoModel.from_pretrained(MODEL_NAME)
+
+        hidden = self.encoder.config.hidden_size
+
+        # freeze embeddings
+        for param in self.encoder.embeddings.parameters():
+            param.requires_grad = False
+
+        # freeze first 6 layers
+        for layer in self.encoder.encoder.layer[:6]:
+            for param in layer.parameters():
+                param.requires_grad = False
+
+        self.dropout = nn.Dropout(0.5)
+
+        self.classifier = nn.Linear(hidden + 1, 1)
+
+    def forward(self, input_ids, attention_mask, entropy):
+
+        out = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        hidden = out.last_hidden_state
+
+        # mean pooling
+        mask = attention_mask.unsqueeze(-1)
+        pooled = (hidden * mask).sum(1) / mask.sum(1)
+
+        # L2 normalize embedding
+        pooled = torch.nn.functional.normalize(pooled, dim=1)
+
+        x = torch.cat([pooled, entropy.unsqueeze(1)], dim=1)
+
+        x = self.dropout(x)
+
+        logits = self.classifier(x)
+
+        return logits.squeeze(-1)
+ 
+import math
+from collections import Counter
+import re
+import random
+
+
+identifier_regex = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+HEADER_PATTERNS = [
+    re.compile(r"^\s*import\s+"),
+    re.compile(r"^\s*from\s+.*\s+import\s+"),
+    re.compile(r"^\s*#include\s+"),
+    re.compile(r"^\s*package\s+"),
+    re.compile(r"^\s*using\s+"),
+    re.compile(r"^\s*require\s*\("),
+]
+
+
+LANG_PATTERNS = [
+    re.compile(r"#include\s*<.*?>"),
+    re.compile(r"public\s+class"),
+    re.compile(r"System\.out\.println"),
+    re.compile(r"console\.log"),
+    re.compile(r"\bpackage\s+\w+"),
+    re.compile(r"\busing\s+\w+"),
+    re.compile(r"<\?php"),
+]
+
+
+PYTHON_KW = {
+"False","await","else","import","pass","None","break","except","in","raise",
+"True","class","finally","is","return","and","continue","for","lambda","try",
+"as","def","from","nonlocal","while","assert","del","global","not","with",
+"async","elif","if","or","yield"
+}
+
+
+C_LIKE_KW = {
+"int","float","double","char","void","long","short","unsigned","signed",
+"if","else","for","while","do","switch","case","default","break","continue",
+"return","struct","class","public","private","protected","static","const",
+"new","delete","this","namespace","using","try","catch","throw",
+"import","package","interface","extends","implements","final"
+}
+
+
+GO_KW = {
+"break","default","func","interface","select",
+"case","defer","go","map","struct",
+"chan","else","goto","package","switch",
+"const","fallthrough","if","range","type",
+"continue","for","import","return","var"
+}
+
+
+PHP_KW = {
+"echo","print","array","function","class","public",
+"private","protected","static","var","new","if",
+"else","elseif","while","for","foreach","return"
+}
+
+
+KEYWORDS = PYTHON_KW | C_LIKE_KW | GO_KW | PHP_KW
+
+
+# ------------------------------------------------
+# IDENTIFIERS
+# ------------------------------------------------
+
+def extract_identifiers(code):
+
+    ids = re.findall(identifier_regex, code)
+
+    return [i for i in ids if i not in KEYWORDS]
+
+
+def identifier_entropy(code):
+
+    ids = extract_identifiers(code)
+
+    if len(ids) == 0:
+        return 0.0
+
+    counter = Counter(ids)
+
+    total = len(ids)
+
+    entropy = 0
+
+    for c in counter.values():
+
+        p = c / total
+        entropy -= p * math.log2(p)
+
+    entropy = entropy / math.log2(len(counter) + 1)
+
+    return entropy
+
+
+# ------------------------------------------------
+# AUGMENTATIONS
+# ------------------------------------------------
+
+def mask_identifiers(code, p=0.3):
+
+    identifiers = list(set(extract_identifiers(code)))
+
+    # quan trọng: sort length để tránh replace lồng nhau
+    identifiers = sorted(identifiers, key=len, reverse=True)
+
+    for name in identifiers:
+
+        if random.random() < p:
+
+            pattern = rf"\b{re.escape(name)}\b"
+
+            code = re.sub(pattern, "VAR", code)
+
+    return code
+
+
+
+def shuffle_identifiers(code, p=0.3):
+
+    ids = list(set(extract_identifiers(code)))
+
+    random.shuffle(ids)
+
+    mapping = {k: f"VAR{i}" for i,k in enumerate(ids)}
+
+    # sort để tránh collision
+    for k in sorted(mapping.keys(), key=len, reverse=True):
+
+        if random.random() < p:
+
+            pattern = rf"\b{re.escape(k)}\b"
+
+            code = re.sub(pattern, mapping[k], code)
+
+    return code
+
+
+
+def mask_comments(code, p=0.5):
+
+    if random.random() < p:
+
+        code = re.sub(r"#.*", "# COMMENT", code)
+
+        code = re.sub(r"//.*", "// COMMENT", code)
+
+        code = re.sub(r"/\*.*?\*/", "/* COMMENT */", code, flags=re.DOTALL)
+
+    return code
+
+
+
+def random_span(ids, max_len):
+
+    target_len = random.randint(int(max_len*0.7), max_len)
+
+    if len(ids) > target_len:
+
+        start = random.randint(0, len(ids) - target_len)
+
+        ids = ids[start:start+target_len]
+
+    return ids
+
+
+
+def multi_span(ids, max_len):
+
+    span = max_len // 2
+
+    if len(ids) <= max_len:
+        return ids
+
+    start1 = random.randint(0, len(ids) - span)
+    start2 = random.randint(0, len(ids) - span)
+
+    span1 = ids[start1:start1+span]
+    span2 = ids[start2:start2+span]
+
+    return (span1 + span2)[:max_len]
+
+
+
+# ------------------------------------------------
+# LANGUAGE AUGMENT
+# ------------------------------------------------
+
+def remove_headers(code, p=0.3):
+
+    if random.random() >= p:
+        return code
+
+    lines = code.split("\n")
+
+    new_lines = []
+
+    for line in lines:
+
+        if any(pattern.match(line) for pattern in HEADER_PATTERNS):
+            continue
+
+        new_lines.append(line)
+
+    return "\n".join(new_lines)
+
+
+
+def language_dropout(code, p=0.3):
+
+    if random.random() >= p:
+        return code
+
+    for pat in LANG_PATTERNS:
+        code = pat.sub("", code)
+
+    return code
+
+
+
+def normalize_indent(code):
+
+    lines = code.split("\n")
+
+    lines = [line.lstrip() for line in lines]
+
+    return "\n".join(lines)
+
+
+
+# ------------------------------------------------
+# REDUCE LANGUAGE TOKENS (SAFE VERSION)
+# ------------------------------------------------
+
+DOUBLE_COLON_PATTERN = re.compile(r"::")
+ARROW_PATTERN = re.compile(r"->")
+PHP_TAG_PATTERN = re.compile(r"<\?php|\?>")
+
+def reduce_language_specific_tokens(code, p=0.5):
+
+    if random.random() >= p:
+        return code
+
+    code = DOUBLE_COLON_PATTERN.sub(" ", code)
+
+    code = ARROW_PATTERN.sub(" ", code)
+
+    code = PHP_TAG_PATTERN.sub(" ", code)
+
+    code = re.sub(r"\s+", " ", code)
+
+    return code.strip()
+ 
+import torch
+import random
+from torch.utils.data import Dataset
+
+
+class TrainCodeDataset(Dataset):
+
+    def __init__(self, hf_dataset, tokenizer, max_len):
+
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+    
+        sample = self.dataset[idx]
+    
+        code = sample["code"]
+        label = sample["label"]
+    
+        # ===== entropy trên code gốc =====
+        entropy = identifier_entropy(code)
+    
+        # -------- augmentation --------
+    
+        code = normalize_indent(code)
+    
+        code = remove_headers(code)
+    
+        code = language_dropout(code)
+    
+        code = reduce_language_specific_tokens(code)
+    
+        code = mask_comments(code)
+    
+        code = mask_identifiers(code)
+    
+        if random.random() < 0.3:
+            code = shuffle_identifiers(code)
+    
+        # ------------------------------
+    
+        enc = self.tokenizer(
+            code,
+            add_special_tokens=True,
+            truncation=False
+        )
+    
+        ids = enc["input_ids"]
+    
+        # span sampling
+        if random.random() < 0.5:
+            ids = random_span(ids, self.max_len)
+        else:
+            ids = multi_span(ids, self.max_len)
+    
+        # attention mask
+        attention = [1] * len(ids)
+    
+        # padding / truncation
+        pad_len = self.max_len - len(ids)
+    
+        if pad_len > 0:
+    
+            ids += [self.tokenizer.pad_token_id] * pad_len
+            attention += [0] * pad_len
+    
+        else:
+    
+            ids = ids[:self.max_len]
+            attention = attention[:self.max_len]
+    
+        return {
+    
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+    
+            "attention_mask": torch.tensor(attention, dtype=torch.long),
+    
+            "entropy": torch.tensor(entropy, dtype=torch.float),
+    
+            "label": torch.tensor(label, dtype=torch.float)
+        }
+
+
+
+class ValidCodeDataset(Dataset):
+
+    def __init__(self, hf_dataset, tokenizer, max_len):
+
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+
+        sample = self.dataset[idx]
+
+        code = sample["code"]
+        label = sample["label"]
+
+        entropy = identifier_entropy(code)
+
+        enc = self.tokenizer(
+
+            code,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_len
+        )
+
+        return {
+
+            "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
+
+            "attention_mask": torch.tensor(enc["attention_mask"], dtype=torch.long),
+
+            "entropy": torch.tensor(entropy, dtype=torch.float),
+
+            "label": torch.tensor(label, dtype=torch.float)
+        }
+ 
+class TestCodeDataset(Dataset):
+
+    def __init__(self, hf_dataset, tokenizer, max_len):
+
+        self.dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+
+        sample = self.dataset[idx]
+
+        code = sample["code"]
+        id_ = sample["ID"]
+
+        enc = self.tokenizer(
+            code,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_len
+        )
+
+        return {
+            "input_ids": torch.tensor(enc["input_ids"]),
+            "attention_mask": torch.tensor(enc["attention_mask"]),
+            "ID": id_
+        }
+ 
+import re
+
+def detect_language(code):
+
+    if re.search(r"#include\s*<", code):
+        return "cpp"
+
+    if "System.out.println" in code or "public class" in code:
+        return "java"
+
+    if "def " in code and ":" in code:
+        return "python"
+
+    if "<?php" in code:
+        return "php"
+
+    if re.search(r"\bfunc\b", code):
+        return "go"
+
+    if "console.log" in code:
+        return "javascript"
+
+    return "other"
+ 
+import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from collections import Counter
+from datasets import load_dataset
+
+# =========================
+# LOAD DATASET
+# =========================
+
+files = {
+    'train': "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A/train.parquet",
+    'validation': "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A/validation.parquet",
+}
+
+train_valid_set = load_dataset("parquet", data_files=files)
+
+test_file = {
+    'test': "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A/test.parquet"
+}
+
+test_set = load_dataset("parquet", data_files=test_file)
+
+train_hf = train_valid_set["train"]
+val_hf = train_valid_set["validation"]
+test_hf = test_set["test"]
+ 
+# =========================
+# BUILD LANGUAGE SAMPLER
+# =========================
+
+langs = train_hf["language"]
+
+freq = Counter(langs)
+
+weights = [1.0 / freq[l] for l in langs]
+
+sampler = WeightedRandomSampler(
+    weights,
+    num_samples=len(weights),
+    replacement=True
+)
+
+
+# =========================
+# DATASET
+# =========================
+max_len = 256
+
+MODEL_NAME = "microsoft/graphcodebert-base"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+train_dataset = TrainCodeDataset(
+    train_hf,
+    tokenizer,
+    max_len
+)
+
+val_dataset = ValidCodeDataset(
+    val_hf,
+    tokenizer,
+    max_len
+)
+
+test_dataset = ValidCodeDataset(
+    test_hf,
+    tokenizer,
+    max_len
+)
+
+
+# =========================
+# DATALOADER
+# =========================
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=64,
+    sampler=sampler,
+    num_workers=2,
+    pin_memory=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=32,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=32,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+
+# =========================
+# CHECK LANGUAGE DISTRIBUTION
+# =========================
+
+print("Train language distribution:")
+print(Counter(train_hf["language"]))
+
+print("Validation language distribution:")
+print(Counter(val_hf["language"]))
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Train language distribution:
+Counter({'Python': 457306, 'C++': 23392, 'Java': 19302})
+Validation language distribution:
+Counter({'Python': 91461, 'C++': 4679, 'Java': 3860})
+ 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FocalLoss(nn.Module):
+
+    def __init__(self, alpha=1.0, gamma=2.0, smoothing=0.0):
+
+        super().__init__()
+
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smoothing = smoothing
+
+    def forward(self, logits, targets):
+
+        targets = targets.float()
+
+        if self.smoothing > 0:
+
+            targets = targets * (1 - self.smoothing) + 0.5 * self.smoothing
+
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction="none"
+        )
+
+        probs = torch.sigmoid(logits)
+
+        pt = targets * probs + (1 - targets) * (1 - probs)
+
+        focal = self.alpha * (1 - pt) ** self.gamma * bce
+
+        return focal.mean()
+
+
+
+
+
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+
+def compute_metrics(preds, labels):
+
+    preds = (preds > 0.5).astype(int)
+
+    return {
+
+        "accuracy": accuracy_score(labels, preds),
+
+        "f1": f1_score(labels, preds),
+
+        "precision": precision_score(labels, preds),
+
+        "recall": recall_score(labels, preds)
+
+    }
+ 
+import os
+from tqdm import tqdm
+
+def evaluate(model, loader, device):
+
+    model.eval()
+
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for batch in loader:
+
+            input_ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            entropy = batch["entropy"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = model(input_ids, mask, entropy)
+
+            probs = torch.sigmoid(logits)
+
+            all_preds.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    metrics = compute_metrics(
+        torch.tensor(all_preds).numpy(),
+        torch.tensor(all_labels).numpy()
+    )
+
+    return metrics
+
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs=5,
+    lr=2e-5,
+    save_dir="checkpoints"
+):
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=0.01
+    )
+
+    total_steps = epochs * len(train_loader)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps
+    )
+
+    criterion = FocalLoss(
+        alpha=1.0,
+        gamma=2.0,
+        smoothing=0.05
+    )
+
+    best_f1 = 0
+
+    log_file = open(os.path.join(save_dir, "training_log.txt"), "w")
+
+    for epoch in range(epochs):
+
+        model.train()
+
+        total_loss = 0
+
+        for batch in tqdm(train_loader):
+
+            input_ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            entropy = batch["entropy"].to(device)
+            labels = batch["label"].to(device)
+
+            optimizer.zero_grad()
+
+            logits = model(input_ids, mask, entropy)
+
+            loss = criterion(logits, labels)
+
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+
+            
+
+        train_loss = total_loss / len(train_loader)
+
+        metrics = evaluate(model, val_loader, device)
+
+        log_line = (
+            f"epoch={epoch} "
+            f"loss={train_loss:.4f} "
+            f"acc={metrics['accuracy']:.4f} "
+            f"f1={metrics['f1']:.4f}\n"
+        )
+
+        print(log_line)
+
+        log_file.write(log_line)
+        log_file.flush()
+
+        if metrics["f1"] > best_f1:
+
+            best_f1 = metrics["f1"]
+
+            torch.save(
+                model.state_dict(),
+                os.path.join(save_dir, "best_model.pt")
+            )
+
+    log_file.close()
+ 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = Detector().to(device)
+
+train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs=2,
+    lr=2e-5
+)
+RobertaModel LOAD REPORT from: microsoft/graphcodebert-base
+Key                             | Status     | 
+--------------------------------+------------+-
+lm_head.dense.weight            | UNEXPECTED | 
+lm_head.layer_norm.bias         | UNEXPECTED | 
+lm_head.decoder.bias            | UNEXPECTED | 
+roberta.embeddings.position_ids | UNEXPECTED | 
+lm_head.bias                    | UNEXPECTED | 
+lm_head.layer_norm.weight       | UNEXPECTED | 
+lm_head.decoder.weight          | UNEXPECTED | 
+lm_head.dense.bias              | UNEXPECTED | 
+pooler.dense.weight             | MISSING    | 
+pooler.dense.bias               | MISSING    | 
+
+Notes:
+- UNEXPECTED	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+  0%|          | 0/7813 [00:00<?, ?it/s]Token indices sequence length is longer than the specified maximum sequence length for this model (571 > 512). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (825 > 512). Running this sequence through the model will result in indexing errors
+100%|██████████| 7813/7813 [4:34:46<00:00,  2.11s/it]
+epoch=0 loss=0.0703 acc=0.9323 f1=0.9375
+
+  0%|          | 0/7813 [00:00<?, ?it/s]Token indices sequence length is longer than the specified maximum sequence length for this model (1020 > 512). Running this sequence through the model will result in indexing errors
+Token indices sequence length is longer than the specified maximum sequence length for this model (638 > 512). Running this sequence through the model will result in indexing errors
+100%|██████████| 7813/7813 [4:35:18<00:00,  2.11s/it]
+epoch=1 loss=0.0510 acc=0.9207 f1=0.9277
+
+ 
+from datasets import load_dataset
+
+test_sample_file = {
+    "test": "/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A/test_sample.parquet"
+}
+
+test_sample_set = load_dataset("parquet", data_files=test_sample_file)["test"]
+from torch.utils.data import DataLoader
+
+test_dataset = ValidCodeDataset(
+    test_sample_set,
+    tokenizer,
+    max_len
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=16,
+    shuffle=False,
+    num_workers=2
+)
+model.load_state_dict(
+    torch.load("checkpoints/best_model.pt")
+)
+
+model.to(device)
+model.eval()
+Detector(
+  (encoder): RobertaModel(
+    (embeddings): RobertaEmbeddings(
+      (word_embeddings): Embedding(50265, 768, padding_idx=1)
+      (token_type_embeddings): Embedding(1, 768)
+      (LayerNorm): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+      (dropout): Dropout(p=0.1, inplace=False)
+      (position_embeddings): Embedding(514, 768, padding_idx=1)
+    )
+    (encoder): RobertaEncoder(
+      (layer): ModuleList(
+        (0-11): 12 x RobertaLayer(
+          (attention): RobertaAttention(
+            (self): RobertaSelfAttention(
+              (query): Linear(in_features=768, out_features=768, bias=True)
+              (key): Linear(in_features=768, out_features=768, bias=True)
+              (value): Linear(in_features=768, out_features=768, bias=True)
+              (dropout): Dropout(p=0.1, inplace=False)
+            )
+            (output): RobertaSelfOutput(
+              (dense): Linear(in_features=768, out_features=768, bias=True)
+              (LayerNorm): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+              (dropout): Dropout(p=0.1, inplace=False)
+            )
+          )
+          (intermediate): RobertaIntermediate(
+            (dense): Linear(in_features=768, out_features=3072, bias=True)
+            (intermediate_act_fn): GELUActivation()
+          )
+          (output): RobertaOutput(
+            (dense): Linear(in_features=3072, out_features=768, bias=True)
+            (LayerNorm): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+            (dropout): Dropout(p=0.1, inplace=False)
+          )
+        )
+      )
+    )
+    (pooler): RobertaPooler(
+      (dense): Linear(in_features=768, out_features=768, bias=True)
+      (activation): Tanh()
+    )
+  )
+  (dropout): Dropout(p=0.5, inplace=False)
+  (classifier): Linear(in_features=769, out_features=1, bias=True)
+)
+test_metrics = evaluate(model, test_loader, device)
+
+print("Test Sample Metrics:", test_metrics)
+Test Sample Metrics: {'accuracy': 0.282, 'f1': 0.3657243816254417, 'precision': 0.22772277227722773, 'recall': 0.9282511210762332}
+ 
+ 
+import pandas as pd
+
+model.eval()
+
+ids = []
+preds = []
+
+with torch.no_grad():
+
+    for batch in test_loader:
+
+        input_ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        entropy = batch["entropy"].to(device)
+
+        logits = model(input_ids, mask, entropy)
+
+        probs = torch.sigmoid(logits)
+
+        labels = (probs > 0.5).int()
+
+        ids.extend(batch["id"])
+        preds.extend(labels.cpu().numpy())
+---------------------------------------------------------------------------
+KeyError                                  Traceback (most recent call last)
+/tmp/ipykernel_24/964866851.py in <cell line: 0>()
+     20         labels = (probs > 0.5).int()
+     21 
+---> 22         ids.extend(batch["id"])
+     23         preds.extend(labels.cpu().numpy())
+
+KeyError: 'id'
+submission = pd.DataFrame({
+    "ID": ids,
+    "label": preds
+})
+
+submission.to_csv("submission.csv", index=False)
+
+print("Saved submission.csv")

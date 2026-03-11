@@ -1,0 +1,37 @@
+## Meta-Training Pipeline Configuration
+## Corresponds to: python meta_train.py --train_csv ... --val_csv ...
+
+common:
+  seed: 42
+
+data:
+  max_length: 512
+
+model:
+  name: "microsoft/graphcodebert-base"
+  dropout: 0.1
+
+sampler:
+  k_domains:    8      # domains per batch
+  m_per_domain: 16     # samples per domain
+  # batch_size = k * m = 128
+
+training:
+  epochs:           3
+  lr:               2.0e-5
+  lr_inner:         1.0e-4   # MAML inner-loop LR for θ' update
+  weight_decay:     0.01
+  warmup_ratio:     0.10     # 10% of total steps
+  fp16:             true
+
+loss_weights:
+  alpha:  0.5   # supervised contrastive
+  beta:   0.1   # generator adversarial
+  gamma:  0.1   # language adversarial
+  delta:  1.0   # meta-test loss multiplier
+
+logging:
+  log_every:      20
+  checkpoint_dir: "checkpoints/meta_training"
+  use_wandb:      false
+  wandb_project:  "semeval-task13-ood"
