@@ -181,6 +181,7 @@ def main() -> None:
     # ----------------------------------------------------------------
     train_sampler = LanguageBalancedSampler(
         language_ids  = train_ds.language_ids_list,
+        labels        = train_ds.labels_list,
         k             = args.k_langs,
         m             = args.m_per_lang,
         shuffle_langs = True,
