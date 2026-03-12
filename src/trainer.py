@@ -33,7 +33,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch import autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
@@ -137,6 +138,7 @@ class MetaTrainer:
     lr_inner        : FOMAML inner-loop LR
     grl_scale       : scale factor in GRL λ schedule (default 5.0)
     fp16            : AMP
+    accumulate_steps: gradient accumulation (default 1)
     log_every       : log every N global steps
     checkpoint_dir  : where to save best model
     use_wandb       : attempt wandb logging
@@ -158,6 +160,7 @@ class MetaTrainer:
         lr_inner:       float = 1e-4,
         grl_scale:      float = 5.0,
         fp16:           bool  = True,
+        accumulate_steps: int = 1,
         log_every:      int   = 20,
         checkpoint_dir: str   = "checkpoints",
         use_wandb:      bool  = False,
@@ -176,6 +179,7 @@ class MetaTrainer:
         self.lr_inner       = lr_inner
         self.grl_scale      = grl_scale
         self.fp16           = fp16 and torch.cuda.is_available()
+        self.accumulate_steps = accumulate_steps
         self.log_every      = log_every
         self.checkpoint_dir = checkpoint_dir
         self.use_wandb      = use_wandb
@@ -213,9 +217,9 @@ class MetaTrainer:
         """Forward pass — uses functional_call if params (θ') are given."""
         if params is not None:
             return self.model.forward_with_params(
-                batch["input_ids"], batch["attention_mask"], batch["entropy"], params
+                batch["input_ids"], batch["attention_mask"], batch["extra_features"], params
             )
-        return self.model(batch["input_ids"], batch["attention_mask"], batch["entropy"])
+        return self.model(batch["input_ids"], batch["attention_mask"], batch["extra_features"])
 
     # ------------------------------------------------------------------
     def _compute_train_loss(
@@ -296,10 +300,12 @@ class MetaTrainer:
                 L_train, breakdown = self._compute_train_loss(meta_train_batch)
 
             # FOMAML: create_graph=False  (fix #3)
+            # retain_graph=True is needed because L_train is also part of L_final
             grads = torch.autograd.grad(
                 L_train,
                 [named_params[n] for n in param_names],
                 create_graph=False,   # << FOMAML key change
+                retain_graph=True,    # Preserve graph for L_final.backward()
                 allow_unused=True,
             )
             grads = tuple(
@@ -310,6 +316,10 @@ class MetaTrainer:
             theta_prime = functional_params_update(
                 named_params, grads, param_names, self.lr_inner
             )
+
+            # Aggressive cache clearing BEFORE meta-test forward pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # ---- Meta step: L_label + 0.3 * L_contrastive (fix #2) ----
             with autocast(device_type=self.device.type, enabled=self.fp16):
@@ -327,13 +337,21 @@ class MetaTrainer:
             L_meta = torch.tensor(0.0, device=self.device)
 
         # ---- Backward & update ----
+        L_final = L_final / self.accumulate_steps
         self.scaler.scale(L_final).backward()
-        self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        if self.scheduler is not None:
-            self.scheduler.step()
+        
+        if (total_steps + 1) % self.accumulate_steps == 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
+            if self.scheduler is not None:
+                self.scheduler.step()
+            
+            # Aggressive cache clearing (optional, but helps fragmentation)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         log = {k: v.item() for k, v in breakdown.items()}
         log["L_meta"]  = L_meta.item()
@@ -369,7 +387,7 @@ class MetaTrainer:
                             "label": batch["label"].cpu().numpy().tolist(),
                             "language_id": batch.get("language_id", torch.zeros_like(batch["label"])).cpu().numpy().tolist(),
                             "generator_id": batch.get("generator_id", torch.zeros_like(batch["label"])).cpu().numpy().tolist(),
-                            "entropy": batch.get("entropy", torch.zeros_like(batch["label"])).cpu().numpy().tolist()
+                            "extra_features": batch.get("extra_features", torch.zeros_like(batch["label"])).cpu().numpy().tolist()
                         }
                         df_debug = pd.DataFrame(b_dict)
                         debug_path = os.path.join(self.checkpoint_dir, f"debug_train_batch_{saved_debug_batches}.csv")
@@ -380,7 +398,7 @@ class MetaTrainer:
                         logger.warning(f"Failed to save debug batch: {e}")
                 # --------------------------
 
-                step_log = self._train_step(batch, total_steps) # Corrected variable name and removed trailing 'r,'
+                step_log = self._train_step(batch, total_steps)
                 self.global_step += 1
 
                 for k, v in step_log.items():
@@ -432,7 +450,8 @@ class MetaTrainer:
 
         for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, dynamic_ncols=True):
             batch  = self._to(batch)
-            out    = self.model(batch["input_ids"], batch["attention_mask"], batch["entropy"])
+            with autocast(device_type=self.device.type, enabled=self.fp16):
+                out    = self.model(batch["input_ids"], batch["attention_mask"], batch["extra_features"])
             logits = out["label_logits"]
             probs  = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
             preds  = logits.argmax(dim=-1).cpu().numpy()

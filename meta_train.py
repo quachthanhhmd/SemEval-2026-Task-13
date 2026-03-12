@@ -34,6 +34,7 @@ from src.dataset import build_datasets
 from src.model   import GraphCodeBERTDomainModel
 from src.sampler  import LanguageBalancedSampler, domain_collate_fn
 from src.trainer  import MetaTrainer
+from src.features import AgnosticFeatureExtractor
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -80,6 +81,8 @@ def parse_args() -> argparse.Namespace:
                    help="Max token length")
     p.add_argument("--registry_path", type=str, default=None,
                    help="Where to save/load domain registry JSON")
+    p.add_argument("--char_crop_limit", type=int, default=None,
+                   help="Randomly crop code to this many characters")
 
     # ---- Model ----
     p.add_argument("--model_name",  type=str,
@@ -87,6 +90,10 @@ def parse_args() -> argparse.Namespace:
                    help="HuggingFace model identifier")
     p.add_argument("--dropout",     type=float, default=0.1,
                    help="Dropout for shared feature layer")
+    p.add_argument("--freeze_layers", type=int, default=0,
+                   help="Number of encoder layers to freeze (0-12)")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Enable gradient checkpointing to save VRAM")
 
     # ---- Sampler ----
     p.add_argument("--batch_size",  type=int,   default=96,
@@ -98,6 +105,8 @@ def parse_args() -> argparse.Namespace:
 
     # ---- Training ----
     p.add_argument("--epochs",      type=int,   default=3)
+    p.add_argument("--accumulate_steps", type=int, default=1,
+                   help="Gradient accumulation steps")
     p.add_argument("--lr",          type=float, default=2e-5)
     p.add_argument("--lr_inner",    type=float, default=5e-5,
                    help="Inner-loop learning rate for MAML θ' update")
@@ -167,12 +176,17 @@ def main() -> None:
     logger.info("Loading tokenizer: %s", args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
+    logger.info("Initializing stylometric feature extractor …")
+    extractor = AgnosticFeatureExtractor()
+
     logger.info("Building datasets …")
     train_ds, val_ds, registry = build_datasets(
         train_file         = args.train_csv,
         val_file           = args.val_csv,
         tokenizer          = tokenizer,
+        extractor          = extractor,
         max_length         = args.max_len,
+        char_crop_limit    = args.char_crop_limit,
         registry_save_path = args.registry_path,
     )
 
@@ -181,6 +195,7 @@ def main() -> None:
     # ----------------------------------------------------------------
     train_sampler = LanguageBalancedSampler(
         language_ids  = train_ds.language_ids_list,
+        labels        = train_ds.labels_list,
         k             = args.k_langs,
         m             = args.m_per_lang,
         shuffle_langs = True,
@@ -216,8 +231,11 @@ def main() -> None:
     model = GraphCodeBERTDomainModel(
         num_generators = registry.num_generators,
         num_languages  = registry.num_languages,
+        num_style      = 10,
         model_name     = args.model_name,
         dropout        = args.dropout,
+        gradient_checkpointing = args.gradient_checkpointing,
+        freeze_layers  = args.freeze_layers,
     ).to(device)
 
     # ----------------------------------------------------------------
@@ -286,6 +304,7 @@ def main() -> None:
         lr_inner       = args.lr_inner,
         grl_scale      = args.grl_scale,
         fp16           = args.fp16,
+        accumulate_steps = args.accumulate_steps,
         log_every      = args.log_every,
         checkpoint_dir = args.checkpoint_dir,
         use_wandb      = args.use_wandb,
