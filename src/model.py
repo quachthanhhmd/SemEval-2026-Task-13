@@ -28,6 +28,28 @@ from src.losses import GradientReversalLayer
 logger = logging.getLogger(__name__)
 
 
+class FeatureGatingNetwork(nn.Module):
+    """
+    Processa le features stilometriche (Agnostic Features) e crea un embedding
+    che verrà usato per modulare il segnale semantico.
+    """
+    def __init__(self, input_dim, output_dim, dropout_rate=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, output_dim * 2),
+            nn.BatchNorm1d(output_dim * 2),
+            nn.Mish(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(output_dim * 2, output_dim),
+            nn.BatchNorm1d(output_dim),
+            nn.Mish(),
+            nn.Dropout(dropout_rate)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+
 class GraphCodeBERTDomainModel(nn.Module):
     """
     Parameters
@@ -47,6 +69,7 @@ class GraphCodeBERTDomainModel(nn.Module):
     MODEL_NAME = "microsoft/graphcodebert-base"
     HIDDEN    = 768
     SHARED    = 512
+    STYLE     = 128
     PROJ_MID  = 256
     PROJ_OUT  = 128
 
@@ -54,18 +77,24 @@ class GraphCodeBERTDomainModel(nn.Module):
         self,
         num_generators: int,
         num_languages:  int,
-        model_name:     str  = MODEL_NAME,
+        num_style:      int   = 10,
+        model_name:     str   = MODEL_NAME,
         dropout:        float = 0.1,
         lam:            float = 1.0,
+        gradient_checkpointing: bool = False,
+        freeze_layers:   int = 0,
     ) -> None:
         super().__init__()
 
+        # ----------------------------------------------------------------
+        # 1. Text Backbone
+        # ----------------------------------------------------------------
         logger.info("Loading backbone: %s", model_name)
         cfg = AutoConfig.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name, config=cfg)
 
         # ----------------------------------------------------------------
-        # Shared feature extractor
+        # 2. Shared feature extractor (Semantic)
         # ----------------------------------------------------------------
         self.shared_feature = nn.Sequential(
             nn.Linear(self.HIDDEN, self.SHARED),
@@ -74,21 +103,30 @@ class GraphCodeBERTDomainModel(nn.Module):
         )
 
         # ----------------------------------------------------------------
-        # Heads: Inputs will be SHARED + 1 (for entropy)
+        # 3. Stylometric Feature Encoder
         # ----------------------------------------------------------------
-        HEAD_IN = self.SHARED + 1
+        self.style_encoder = FeatureGatingNetwork(
+            input_dim=num_style,
+            output_dim=self.STYLE,
+            dropout_rate=dropout
+        )
+
+        # ----------------------------------------------------------------
+        # 4. Fusion & Adapters
+        # ----------------------------------------------------------------
+        FUSION_IN = self.SHARED + self.STYLE
 
         # ----------------------------------------------------------------
         # Decouple Task vs Domain representations (fix gradient conflict)
         # ----------------------------------------------------------------
         self.task_adapter = nn.Sequential(
-            nn.Linear(HEAD_IN, self.SHARED),
+            nn.Linear(FUSION_IN, self.SHARED),
             nn.GELU(),
             nn.Dropout(dropout),
         )
 
         self.domain_adapter = nn.Sequential(
-            nn.Linear(HEAD_IN, self.SHARED),
+            nn.Linear(FUSION_IN, self.SHARED),
             nn.GELU(),
             nn.Dropout(dropout),
         )
@@ -112,10 +150,25 @@ class GraphCodeBERTDomainModel(nn.Module):
             nn.Linear(self.PROJ_MID, self.PROJ_OUT),
         )
 
+        if gradient_checkpointing:
+            logger.info("Enabling gradient checkpointing...")
+            self.encoder.gradient_checkpointing_enable()
+
+        if freeze_layers > 0:
+            logger.info("Freezing first %d layers of the encoder...", freeze_layers)
+            # GraphCodeBERT (Roberta) has embeddings at index 0, then layers in encoder.layer
+            # Freeze embeddings
+            for p in self.encoder.embeddings.parameters():
+                p.requires_grad = False
+            # Freeze layers
+            for i in range(min(freeze_layers, 12)):
+                for p in self.encoder.encoder.layer[i].parameters():
+                    p.requires_grad = False
+
         self._init_heads()
         logger.info(
-            "GraphCodeBERTDomainModel ready | generators=%d | languages=%d | entropy=True",
-            num_generators, num_languages,
+            "GraphCodeBERTDomainModel ready | generators=%d | languages=%d | style=%d",
+            num_generators, num_languages, num_style
         )
 
     # ------------------------------------------------------------------
@@ -133,7 +186,7 @@ class GraphCodeBERTDomainModel(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-        for module_seq in [self.shared_feature, self.task_adapter, self.domain_adapter]:
+        for module_seq in [self.shared_feature, self.task_adapter, self.domain_adapter, self.style_encoder]:
             for m in module_seq.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
@@ -161,7 +214,7 @@ class GraphCodeBERTDomainModel(nn.Module):
         self,
         input_ids:      torch.Tensor,
         attention_mask: torch.Tensor,
-        entropy:        torch.Tensor,
+        extra_features: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns a dict with:
@@ -169,13 +222,16 @@ class GraphCodeBERTDomainModel(nn.Module):
             generator_logits : [B, num_generators]
             language_logits  : [B, num_languages]
             projection       : [B, 128]  (L2-normalised)
-            shared_features  : [B, 513]
+            shared_features  : [B, FUSION_IN]
         """
         cls = self.encode(input_ids, attention_mask)         # [B, 768]
-        feat = self.shared_feature(cls)                      # [B, 512]
+        sem_feat = self.shared_feature(cls)                   # [B, 512]
         
-        # Concatenate entropy feature
-        feat = torch.cat([feat, entropy.unsqueeze(1)], dim=1) # [B, 513]
+        # Stylometric encoding
+        style_feat = self.style_encoder(extra_features)      # [B, 128]
+
+        # Fusion
+        feat = torch.cat([sem_feat, style_feat], dim=1)      # [B, 640]
 
         # Decouple features
         task_feat   = self.task_adapter(feat)     # [B, 512]
@@ -206,7 +262,7 @@ class GraphCodeBERTDomainModel(nn.Module):
         self,
         input_ids:      torch.Tensor,
         attention_mask: torch.Tensor,
-        entropy:        torch.Tensor,
+        extra_features: torch.Tensor,
         params:         Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         """
@@ -217,5 +273,5 @@ class GraphCodeBERTDomainModel(nn.Module):
         except ImportError:
             from torch._functorch.eager_transforms import functional_call
 
-        out = functional_call(self, params, (input_ids, attention_mask, entropy))
+        out = functional_call(self, params, (input_ids, attention_mask, extra_features))
         return out

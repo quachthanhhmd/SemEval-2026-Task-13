@@ -26,6 +26,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 from datasets import load_dataset as hf_load_dataset
+from src.features import AgnosticFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -255,14 +256,18 @@ class CodeDataset(Dataset):
         df: Any,  # Can be pd.DataFrame or HF Dataset
         tokenizer: PreTrainedTokenizerBase,
         registry: DomainRegistry,
+        extractor: Optional[AgnosticFeatureExtractor] = None,
         max_length: int = 512,
         augment: bool = False,
+        char_crop_limit: Optional[int] = None,
     ) -> None:
         self.dataset    = df
         self.tokenizer  = tokenizer
         self.registry   = registry
+        self.extractor  = extractor
         self.max_length = max_length
         self.augment    = augment
+        self.char_crop_limit = char_crop_limit
 
         # Cache meta-ids for sampling speed
         self._domain_ids    = self._build_ids("domain")
@@ -296,8 +301,24 @@ class CodeDataset(Dataset):
         code = str(row["code"])
         label = int(row["label"])
 
-        # 1. Entropy on original code
-        entropy = identifier_entropy(code)
+        # 0. Random char crop (VRAM Optimization)
+        if self.char_crop_limit and len(code) > self.char_crop_limit:
+            start_idx = random.randint(0, len(code) - self.char_crop_limit)
+            code = code[start_idx : start_idx + self.char_crop_limit]
+
+        # 1. Stylometric Features (10 features)
+        if self.extractor is not None:
+            raw_features = self.extractor.extract_all(code)
+            extra_features = torch.tensor(raw_features, dtype=torch.float)
+            # Log normalization for unbounded features (0: avg_id_len, 6: line_std)
+            for i in [0, 6]:
+                extra_features[i] = torch.log1p(extra_features[i])
+            extra_features = torch.clamp(extra_features, min=0.0, max=100.0)
+        else:
+            # Fallback to just identifier entropy if extractor is not provided
+            entropy = identifier_entropy(code)
+            extra_features = torch.zeros(10, dtype=torch.float)
+            extra_features[1] = entropy # idx 1 is id_entropy
 
         # 2. Augmentations (if enabled)
         if self.augment:
@@ -339,7 +360,7 @@ class CodeDataset(Dataset):
             "input_ids":      torch.tensor(ids,            dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "label":          torch.tensor(label,          dtype=torch.long),
-            "entropy":        torch.tensor(entropy,        dtype=torch.float),
+            "extra_features": extra_features,
             "domain_id":      torch.tensor(self._domain_ids[idx],    dtype=torch.long),
             "language_id":    torch.tensor(self._language_ids[idx],  dtype=torch.long),
             "generator_id":   torch.tensor(self._generator_ids[idx], dtype=torch.long),
@@ -369,7 +390,9 @@ def build_datasets(
     train_file: str,
     val_file: str,
     tokenizer: PreTrainedTokenizerBase,
+    extractor: Optional[AgnosticFeatureExtractor] = None,
     max_length: int = 512,
+    char_crop_limit: Optional[int] = None,
     registry_save_path: Optional[str] = None,
 ) -> Tuple[CodeDataset, CodeDataset, DomainRegistry]:
     """
@@ -405,8 +428,8 @@ def build_datasets(
     if registry_save_path:
         registry.save(registry_save_path)
 
-    train_dataset = CodeDataset(train_ds_src, tokenizer, registry, max_length, augment=True)
-    val_dataset   = CodeDataset(val_ds_src,   tokenizer, registry, max_length, augment=False)
+    train_dataset = CodeDataset(train_ds_src, tokenizer, registry, extractor, max_length, augment=True, char_crop_limit=char_crop_limit)
+    val_dataset   = CodeDataset(val_ds_src,   tokenizer, registry, extractor, max_length, augment=False, char_crop_limit=char_crop_limit)
 
     logger.info("Train size: %d | Val size: %d", len(train_dataset), len(val_dataset))
     return train_dataset, val_dataset, registry
