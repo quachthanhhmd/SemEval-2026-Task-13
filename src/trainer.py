@@ -33,7 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
@@ -180,7 +180,7 @@ class MetaTrainer:
         self.checkpoint_dir = checkpoint_dir
         self.use_wandb      = use_wandb
 
-        self.scaler    = GradScaler(enabled=self.fp16)
+        self.scaler    = GradScaler("cuda", enabled=self.fp16)
         self.supcon_fn = SupConLoss(temperature=0.07).to(device)
 
         os.makedirs(checkpoint_dir, exist_ok=True)
