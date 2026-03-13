@@ -22,14 +22,14 @@ Fixes applied vs. original design
    Prevents adversarial training from being too aggressive early on.
 """
 
-from __future__ import annotations
-
-import logging
-import math
-import os
-import random
+import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+
+import math
+import logging
+import os
+import random
 
 import numpy as np
 import torch
@@ -38,7 +38,6 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from tqdm import tqdm
 
 from src.losses import SupConLoss, compute_total_loss
 from src.model import GraphCodeBERTDomainModel
@@ -442,25 +441,23 @@ class MetaTrainer:
 
         saved_debug_batches = 0
 
+        self.train_start_time = time.time()
+
         for epoch in range(actual_start_epoch, num_epochs if num_epochs > 0 else 10000):
             if num_steps > 0 and self.global_step >= num_steps:
                 break
                 
             self.current_epoch = epoch
-            logger.info("Epoch %d (Step %d)", epoch + 1, self.global_step)
             epoch_logs: Dict[str, float] = defaultdict(float)
 
             if hasattr(self.train_loader.batch_sampler, "set_epoch"):
                 self.train_loader.batch_sampler.set_epoch(epoch)
 
-            pbar = tqdm(self.train_loader, desc=f"Train E{epoch+1}")
-            for step, batch in enumerate(pbar): # Added enumerate and step
+            for step, batch in enumerate(self.train_loader):
                 # --- Debug Batch Saving ---
                 if epoch == 1 and saved_debug_batches < 3:
                     try:
                         import pandas as pd
-                        # Tokenizer is needed to decode, but trainer itself doesn't hold it.
-                        # We just save the raw tensors/ids to a dict and then DF.
                         b_dict = {
                             "input_ids": batch["input_ids"].cpu().numpy().tolist(),
                             "label": batch["label"].cpu().numpy().tolist(),
@@ -477,7 +474,7 @@ class MetaTrainer:
                         logger.warning(f"Failed to save debug batch: {e}")
                 # --------------------------
 
-                step_log = self._train_step(batch, total_steps) # Corrected variable name and removed trailing 'r,'
+                step_log = self._train_step(batch, total_steps)
                 self.global_step += 1
 
                 for k, v in step_log.items():
@@ -485,9 +482,28 @@ class MetaTrainer:
 
                 if self.global_step % self.log_every == 0:
                     self._log(step_log, prefix="train/step")
-                    # Dynamic log string from breakdown keys
-                    msg = " ".join([f"{k.split('_')[-1]}={step_log[k]:.3f}" for k in step_log if k.startswith("L_")])
-                    pbar.set_postfix_str(f"{msg} lam={step_log['grl_lam']:.3f}")
+                    
+                    # Compute ETA
+                    elapsed = time.time() - self.train_start_time
+                    steps_done = self.global_step
+                    steps_left = self.total_steps - steps_done
+                    sec_per_step = elapsed / max(steps_done, 1)
+                    eta_sec = steps_left * sec_per_step
+                    
+                    # Format ETA
+                    if eta_sec > 3600:
+                        eta_str = f"{eta_sec // 3600:.0f}h { (eta_sec % 3600) // 60:.0f}m"
+                    else:
+                        eta_str = f"{eta_sec // 60:.0f}m {eta_sec % 60:.0f}s"
+                    
+                    print(
+                        f"Epoch {epoch+1} | "
+                        f"step {self.global_step}/{self.total_steps} | "
+                        f"loss={step_log['L_final']:.4f} | "
+                        f"meta={step_log['L_meta']:.4f} | "
+                        f"lam={step_log['grl_lam']:.3f} | "
+                        f"ETA {eta_str}"
+                    )
 
             n_steps = len(self.train_loader)
             avg_log = {k: v / n_steps for k, v in epoch_logs.items()}
@@ -524,7 +540,7 @@ class MetaTrainer:
         self.model.eval()
         all_preds, all_labels, all_probs = [], [], []
 
-        for batch in tqdm(self.val_loader, desc="Evaluating", leave=False, dynamic_ncols=True):
+        for batch in self.val_loader:
             batch  = self._to(batch)
             out    = self.model(batch["input_ids"], batch["attention_mask"], batch["entropy"])
             logits = out["label_logits"]
