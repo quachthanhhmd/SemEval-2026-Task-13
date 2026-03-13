@@ -51,16 +51,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Confidence Thresholds
-# ---------------------------------------------------------------------------
-HIGH_CONF_MEAN_MIN   = 0.95   # mean_prob > this for easy AI
-HIGH_CONF_MEAN_MAX   = 0.05   # mean_prob < this for easy Human (1 - 0.95)
-HIGH_CONF_VAR_MAX    = 0.02   # variance < this for easy
-MEDIUM_CONF_MEAN_MIN = 0.60   # 0.60 < mean <= 0.95 for medium
-MEDIUM_CONF_MEAN_MAX = 0.40   # < 0.40 for medium Human (symmetric)
-HARD_VAR_MIN         = 0.05   # variance >= this for hard
-HARD_DISAGREE_MIN    = 0.40   # disagreement >= this for hard
+# Thresholds are now passed via CLI arguments to categorize_samples()
 
 
 # ---------------------------------------------------------------------------
@@ -148,26 +139,25 @@ def run_tta_and_collect_stats(model, dataloader, device: torch.device, tta_views
 # ---------------------------------------------------------------------------
 # Categorize by Confidence
 # ---------------------------------------------------------------------------
-def categorize_samples(mean_probs, var_probs, disagree):
+def categorize_samples(mean_probs, var_probs, disagree, upper, lower, args):
     """
-    Returns boolean masks for easy, medium, and hard sets.
-
-    - easy   : (mean > 0.95 OR mean < 0.05) AND var < 0.02
-    - hard   : var >= 0.05 OR disagree >= 0.40 (dominant condition)
-    - medium : everything else in 0.40 < mean <= 0.95
+    Returns boolean masks for easy, medium, and hard sets based on configurable thresholds.
     """
     # Hard condition takes priority
-    is_hard = (var_probs >= HARD_VAR_MIN) | (disagree >= HARD_DISAGREE_MIN)
+    is_hard = (var_probs >= args.hard_var) | (disagree >= args.hard_disagree)
 
-    # Easy: very high or very low confidence, low variance
-    is_easy_ai     = (mean_probs > HIGH_CONF_MEAN_MIN)  & (var_probs < HIGH_CONF_VAR_MAX)
-    is_easy_human  = (mean_probs < HIGH_CONF_MEAN_MAX)  & (var_probs < HIGH_CONF_VAR_MAX)
+    # Easy: distance from threshold > margin AND low variance
+    is_easy_ai     = (mean_probs > upper) & (var_probs < args.high_conf_var)
+    is_easy_human  = (mean_probs < lower) & (var_probs < args.high_conf_var)
     is_easy = (is_easy_ai | is_easy_human) & (~is_hard)
 
-    # Medium: uncertain but not hard
-    is_medium_ai    = (mean_probs > MEDIUM_CONF_MEAN_MAX) & (mean_probs <= HIGH_CONF_MEAN_MIN)
-    is_medium_human = (mean_probs < (1 - MEDIUM_CONF_MEAN_MAX)) & (mean_probs >= HIGH_CONF_MEAN_MAX)
-    is_medium = (is_medium_ai | is_medium_human) & (~is_hard) & (~is_easy)
+    # Medium: samples near the decision boundary
+    is_medium = (
+        (mean_probs >= lower) &
+        (mean_probs <= upper) &
+        (~is_hard) &
+        (~is_easy)
+    )
 
     return is_easy, is_medium, is_hard
 
@@ -207,13 +197,24 @@ def run_extraction(args):
 
     # 5. TTA Inference — Collect View Statistics
     logger.info(f"Running TTA Inference (Views={args.tta_views}) for pseudo-label extraction...")
+    logger.info(f"Decision threshold: {args.decision_threshold}")
+    logger.info(f"Easy margin: {args.easy_margin}")
+    
+    # Compute boundaries relative to decision threshold
+    upper = min(1.0, args.decision_threshold + args.easy_margin)
+    lower = max(0.0, args.decision_threshold - args.easy_margin)
+    
+    logger.info(f"Easy AI threshold: > {upper:.3f}")
+    logger.info(f"Easy Human threshold: < {lower:.3f}")
+    logger.info(f"Medium region: [{lower:.3f}, {upper:.3f}]")
+
     mean_probs, var_probs, disagree, gt_labels = run_tta_and_collect_stats(
         model, dataloader, device, args.tta_views
     )
 
-    # 6. Categorize
-    is_easy, is_medium, is_hard = categorize_samples(mean_probs, var_probs, disagree)
-    pseudo_labels = (mean_probs >= 0.5).astype(int)
+    # 6. Categorize using decision-relative thresholds
+    is_easy, is_medium, is_hard = categorize_samples(mean_probs, var_probs, disagree, upper, lower, args)
+    pseudo_labels = (mean_probs >= args.decision_threshold).astype(int)
 
     # 7. Build output base dataframe
     stats_df = test_df.copy().reset_index(drop=True)
@@ -294,6 +295,13 @@ if __name__ == "__main__":
                         help="Number of TTA augmentation views per sample")
     parser.add_argument("--no_code",         action="store_true",
                         help="Exclude code column in output (useful for large datasets)")
+
+    # Threshold & Margin Arguments
+    parser.add_argument("--decision_threshold", type=float, default=0.74, help="Decision boundary used to classify AI vs Human")
+    parser.add_argument("--easy_margin",        type=float, default=0.20, help="Distance from threshold required for high-confidence pseudo labels")
+    parser.add_argument("--high_conf_var",      type=float, default=0.02, help="Max variance for high-confidence (easy) samples")
+    parser.add_argument("--hard_var",           type=float, default=0.05, help="Min variance for hard samples")
+    parser.add_argument("--hard_disagree",      type=float, default=0.40, help="Min disagreement for hard samples")
 
     args = parser.parse_args()
     run_extraction(args)

@@ -11,5 +11,10 @@ python extract_pseudo_samples.py \
     --tta_views 5 \
     --batch_size 16 \
     --num_workers 4 \
-    --max_len 512
+    --max_len 512 \
+    --decision_threshold 0.74 \
+    --easy_margin 0.20 \
+    --high_conf_var 0.02 \
+    --hard_var 0.05 \
+    --hard_disagree 0.40
     # Optionally add --no_code to exclude the source code column in outputs

@@ -229,11 +229,10 @@ def run_inference(args):
             batch_size = batch["labels"].size(0)
             logits = logits.view(batch_size, args.tta_views, 2)
             
-            # Ensemble: Logits Mean -> Softmax (Better calibration)
-            mean_logits = torch.mean(logits, dim=1) # [B, 2]
-            probs = F.softmax(mean_logits, dim=-1)   # [B, 2]
+            # Ensemble: softmax then mean (Better calibration)
+            view_probs = F.softmax(logits, dim=-1)[:, :, 1] # [B, V]
+            ai_probs = view_probs.mean(dim=1).cpu().numpy()  # [B]
             
-            ai_probs = probs[:, 1].cpu().numpy()
             all_final_probs.extend(ai_probs)
             
             if has_labels:
@@ -241,11 +240,13 @@ def run_inference(args):
 
     # 6. Post-process
     all_final_probs = np.array(all_final_probs)
-    all_final_preds = (all_final_probs >= 0.5).astype(int)
+    
+    logger.info(f"Decision threshold: {args.decision_threshold}")
+    all_final_preds = (all_final_probs >= args.decision_threshold).astype(int)
     
     if has_labels:
         all_labels = np.array(all_labels)
-        logger.info("\nEvaluation Results:")
+        logger.info(f"\nEvaluation Results @ threshold {args.decision_threshold}:")
         acc = accuracy_score(all_labels, all_final_preds)
         auc = roc_auc_score(all_labels, all_final_probs)
         logger.info(f"Accuracy: {acc:.4f} | ROC-AUC: {auc:.4f}")
@@ -276,6 +277,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--tta_views", type=int, default=5)
+    parser.add_argument("--decision_threshold", type=float, default=0.5,
+                        help="Probability threshold used to classify AI vs Human")
     
     args = parser.parse_args()
     run_inference(args)

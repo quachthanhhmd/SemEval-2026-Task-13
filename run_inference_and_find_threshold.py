@@ -77,9 +77,8 @@ def run_tta_inference(model, dataloader, device: torch.device, tta_views: int):
         batch_size = batch["labels"].size(0)
         logits = logits.view(batch_size, tta_views, 2)       # [B, V, 2]
 
-        # TTA ensemble: mean over views, then softmax
-        mean_logits = logits.mean(dim=1)                     # [B, 2]
-        probs = F.softmax(mean_logits, dim=-1)[:, 1]         # [B] AI probability
+        view_probs = F.softmax(logits, dim=-1)[:, :, 1]          # [B, V] AI probabilities
+        probs = view_probs.mean(dim=1)                           # [B]
 
         all_probs.extend(probs.cpu().numpy())
         all_labels.extend(batch["labels"].numpy())
@@ -101,7 +100,7 @@ def sweep_thresholds(probs, labels, n_steps: int = 1000):
         f1_score, balanced_accuracy_score,
     )
 
-    thresholds = np.linspace(0.0, 1.0, n_steps)
+    thresholds = np.linspace(0.001, 0.999, n_steps)
     results = {
         "threshold":         thresholds,
         "f1":                np.zeros(n_steps),
