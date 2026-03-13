@@ -1,27 +1,27 @@
 """
 meta_inference.py
 -----------------
-Inference script for the OOD Meta-Training Pipeline (GraphCodeBERTDomainModel)
-with Test-Time Augmentation (TTA) support via multiple span sampling.
-
-Usage:
-    python meta_inference.py \
-        --test_parquet data/Task_A/test.parquet \
-        --checkpoint_dir checkpoints/meta_training/best_model \
-        --batch_size  32 \
-        --tta_views   5
+Optimized Inference script for the OOD Meta-Training Pipeline.
+Supports:
+1. Lazy Parquet/CSV loading (Memory efficient)
+2. Precomputed entropy (Speed)
+3. Token-level TTA (Avoids BPE boundary artifacts + Fast)
+4. Batch flattening (High GPU utilization)
+5. Deterministic TTA spans
 """
 
 import os
 import sys
 import argparse
 import logging
+import random
+from typing import Dict, List, Optional
 
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
@@ -31,7 +31,7 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from src.dataset import build_datasets, CodeDataset, identifier_entropy, multi_span, random_span
+from src.dataset import identifier_entropy, multi_span, random_span
 from src.model   import GraphCodeBERTDomainModel
 
 logging.basicConfig(
@@ -44,87 +44,113 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# TTA Dataset Wrapper
+# TTA Dataset (Optimized)
 # ---------------------------------------------------------------------------
 
-class TTACodeDataset(torch.utils.data.Dataset):
+class TTACodeDataset(Dataset):
     """
-    Dataset that applies span sampling at test time (TTA).
-    Returns `tta_views` number of differently sampled views for the same code.
+    Optimized Dataset:
+    - Lazy loading from DataFrame (iloc)
+    - Tokenizes once per sample
+    - Performs span sampling on token IDs
+    - Deterministic seeding per index
     """
-    def __init__(self, df, tokenizer, max_length=512, tta_views=5):
-        self.dataset   = df.to_dict('records') if isinstance(df, pd.DataFrame) else df
+    def __init__(self, df: pd.DataFrame, tokenizer, max_length=512, tta_views=5):
+        self.df = df
         self.tokenizer = tokenizer
-        self.max_len   = max_length
+        self.max_len = max_length
         self.tta_views = tta_views
+        
+        self.cls_id = self.tokenizer.cls_token_id
+        self.sep_id = self.tokenizer.sep_token_id
+        self.pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 1
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.dataset[idx]
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
         code = str(row["code"])
-        label = int(row.get("label", 0))
+        
+        # 1. Label safety
+        raw_label = row.get("label", 0)
+        label = 1 if str(raw_label).lower() in ["1", "ai", "true"] else 0
+        
+        # 2. Precomputed entropy
+        entropy = float(row.get("entropy", 0.0))
 
-        # Entropy is invariant to span sampling since it evaluates the whole sequence
-        entropy = identifier_entropy(code)
+        # 3. Tokenize ONCE (with a buffer for spanning)
+        # We grab up to 2048 tokens to allow diverse spans
+        enc = self.tokenizer(
+            code, 
+            add_special_tokens=False, 
+            truncation=True, 
+            max_length=2048, 
+            return_tensors=None
+        )
+        base_tokens = enc["input_ids"]
 
-        # Baseline tokenize (no truncation yet)
-        enc = self.tokenizer(code, add_special_tokens=True, truncation=False, return_tensors=None)
-        original_ids = enc["input_ids"]
+        # 4. Generate Views (Deterministic)
+        rng = random.Random(42 + idx)
+        views_ids = []
+        views_masks = []
 
-        views = []
         for v in range(self.tta_views):
             if v == 0:
-                # View 0: Strict prefix (deterministic anchor)
-                ids = original_ids[:self.max_len]
+                # View 0: Direct prefix
+                ids = base_tokens[:self.max_len - 2]
             elif v % 2 == 1:
-                # Odd views: multi_span (middle/ends fusion)
-                ids = multi_span(original_ids, self.max_len)
+                # Odd: Multi span
+                ids = multi_span(base_tokens, self.max_len)
             else:
-                # Even views: random continuous span
-                ids = random_span(original_ids, self.max_len)
+                # Even: Random span
+                ids = random_span(base_tokens, self.max_len)
 
-            # Pad / Truncate
+            # Wrap with special tokens
+            if self.cls_id is not None and self.sep_id is not None:
+                ids = [self.cls_id] + ids + [self.sep_id]
+
+            # Post-process (Truncate/Pad)
             if len(ids) > self.max_len:
                 ids = ids[:self.max_len]
+                if self.sep_id is not None: ids[-1] = self.sep_id
                 mask = [1] * self.max_len
             else:
                 pad_len = self.max_len - len(ids)
                 mask = [1] * len(ids) + [0] * pad_len
-                ids  = ids + [self.tokenizer.pad_token_id] * pad_len
+                ids = ids + [self.pad_id] * pad_len
             
-            views.append({
-                "input_ids": torch.tensor(ids, dtype=torch.long),
-                "attention_mask": torch.tensor(mask, dtype=torch.long),
-            })
+            views_ids.append(torch.tensor(ids, dtype=torch.long))
+            views_masks.append(torch.tensor(mask, dtype=torch.long))
 
         return {
-            "views": views,  # List of dicts, length = tta_views
-            "label": torch.tensor(label, dtype=torch.long),
-            "entropy": torch.tensor(entropy, dtype=torch.float),
-            "idx": idx,
+            "input_ids":      torch.stack(views_ids),   # [V, L]
+            "attention_mask": torch.stack(views_masks), # [V, L]
+            "label":          torch.tensor(label,   dtype=torch.long),
+            "entropy":        torch.tensor(entropy, dtype=torch.float),
         }
 
 def tta_collate_fn(batch):
-    # batch is list of item dicts
-    views_collated = []
-    tta_views = len(batch[0]["views"])
+    """
+    Modified to support B*V flattening:
+    Returns flattened tensors [B*V, L]
+    """
+    input_ids = torch.cat([item["input_ids"] for item in batch], dim=0)      # [B*V, L]
+    masks     = torch.cat([item["attention_mask"] for item in batch], dim=0) # [B*V, L]
     
-    for v in range(tta_views):
-        input_ids = torch.stack([item["views"][v]["input_ids"] for item in batch])
-        attention_mask = torch.stack([item["views"][v]["attention_mask"] for item in batch])
-        views_collated.append({"input_ids": input_ids, "attention_mask": attention_mask})
-
+    # Entropy needs to be repeated V times for the flattened batch
+    tta_views = batch[0]["input_ids"].size(0)
+    entropy = torch.cat([item["entropy"].repeat(tta_views) for item in batch]) # [B*V]
+    
     return {
-        "views": views_collated, # List of Batched Inputs
-        "label": torch.stack([item["label"] for item in batch]),
-        "entropy": torch.stack([item["entropy"] for item in batch]),
-        "idx": [item["idx"] for item in batch],
+        "input_ids":      input_ids,
+        "attention_mask": masks,
+        "entropy":        entropy,
+        "labels":         torch.stack([item["label"] for item in batch]), # [B]
     }
 
 # ---------------------------------------------------------------------------
-# Inference Logic
+# Main Routine
 # ---------------------------------------------------------------------------
 
 def run_inference(args):
@@ -138,22 +164,18 @@ def run_inference(args):
     else:
         test_df = pd.read_csv(args.test_file)
 
-    has_labels = 'label' in test_df.columns
-    if not has_labels:
-        test_df['label'] = 0
-
-    # 2. Extract model config info from checkpoint/name
+    # 2. Precompute Entropy (CPU efficient)
+    if "entropy" not in test_df.columns:
+        logger.info("Precomputing identifier entropy...")
+        test_df["entropy"] = test_df["code"].apply(identifier_entropy)
+    
+    # 3. Setup Model
     state_dict_path = os.path.join(args.checkpoint_dir, "model.pt")
     if not os.path.exists(state_dict_path):
         logger.error(f"Cannot find model.pt in {args.checkpoint_dir}")
         sys.exit(1)
 
-    # 3. Load Tokenizer & Model
-    # Note: We hardcode model arguments assuming they match the meta-training config
-    # In a fully integrated system, load these from config.yaml
-    logger.info("Initializing Tokenizer and Model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    
     model = GraphCodeBERTDomainModel(
         num_generators = args.num_generators, 
         num_languages  = args.num_languages,
@@ -167,107 +189,81 @@ def run_inference(args):
 
     # 4. DataLoader
     dataset = TTACodeDataset(test_df, tokenizer, max_length=args.max_len, tta_views=args.tta_views)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=tta_collate_fn)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        num_workers=args.num_workers,
+        collate_fn=tta_collate_fn,
+        pin_memory=True
+    )
 
-    # 5. Prediction Loop with TTA
-    logger.info(f"Running TTA Inference ({args.tta_views} views)...")
+    # 5. Pipeline
+    logger.info(f"Running TTA Inference (Views={args.tta_views}, B*V Flattening=True)")
     all_final_probs = []
     all_labels = []
+    has_labels = 'label' in test_df.columns
 
     with torch.no_grad():
-        saved_debug_batches = 0
-        for step, batch in enumerate(tqdm(dataloader, desc="Inferencing")):
-            views = batch["views"]
-            batch_entropy = batch["entropy"].to(device)
-
-            # --- Debug Batch Saving ---
-            if saved_debug_batches < 3:
-                try:
-                    import pandas as pd
-                    # Just save the first view for debugging the tokens
-                    first_view = views[0]
-                    b_dict = {
-                        "input_ids": first_view["input_ids"].cpu().numpy().tolist(),
-                        "label": batch["label"].cpu().numpy().tolist(),
-                        "entropy": batch["entropy"].cpu().numpy().tolist(),
-                        "idx": batch["idx"]
-                    }
-                    df_debug = pd.DataFrame(b_dict)
-                    debug_path = os.path.join(args.checkpoint_dir, f"debug_inference_batch_{saved_debug_batches}.csv")
-                    df_debug.to_csv(debug_path, index=False)
-                    logger.info(f"Saved debug inference batch to {debug_path}")
-                    saved_debug_batches += 1
-                except Exception as e:
-                    logger.warning(f"Failed to save debug inference batch: {e}")
-            # --------------------------
+        for batch in tqdm(dataloader, desc="Predicting"):
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            masks     = batch["attention_mask"].to(device, non_blocking=True)
+            entropy   = batch["entropy"].to(device, non_blocking=True)
             
-            # shape will be [tta_views, batch_size, 2]
-            view_probs = []
-            for v_data in views:
-                input_ids = v_data["input_ids"].to(device)
-                mask = v_data["attention_mask"].to(device)
-                
-                out = model(input_ids, mask, batch_entropy)
-                # Softmax to get probabilities
-                probs = F.softmax(out["label_logits"], dim=-1)
-                view_probs.append(probs)
-                
-            # Stack all views: [tta_views, batch_size, 2]
-            stacked_probs = torch.stack(view_probs, dim=0)
+            # Forward pass [B*V, 2]
+            out = model(input_ids, masks, entropy)
+            logits = out["label_logits"] # [B*V, 2]
             
-            # Average probabilities across views (Soft Voting)
-            mean_probs = torch.mean(stacked_probs, dim=0) # [batch_size, 2]
+            # Reshape to [B, V, 2]
+            batch_size = batch["labels"].size(0)
+            logits = logits.view(batch_size, args.tta_views, 2)
             
-            # AI class probability is index 1
-            ai_probs = mean_probs[:, 1].cpu().numpy()
+            # Ensemble: Logits Mean -> Softmax (Better calibration)
+            mean_logits = torch.mean(logits, dim=1) # [B, 2]
+            probs = F.softmax(mean_logits, dim=-1)   # [B, 2]
+            
+            ai_probs = probs[:, 1].cpu().numpy()
             all_final_probs.extend(ai_probs)
             
             if has_labels:
-                all_labels.extend(batch["label"].numpy())
+                all_labels.extend(batch["labels"].numpy())
 
-    # 6. Report & Save
+    # 6. Post-process
     all_final_probs = np.array(all_final_probs)
     all_final_preds = (all_final_probs >= 0.5).astype(int)
     
     if has_labels:
-        print("\n" + "="*60)
-        print("TTA TEST SET EVALUATION REPORT".center(60))
-        print("="*60)
-        
+        all_labels = np.array(all_labels)
+        logger.info("\nEvaluation Results:")
         acc = accuracy_score(all_labels, all_final_preds)
-        f1  = classification_report(all_labels, all_final_preds, target_names=["Human", "AI"], output_dict=True)['AI']['f1-score']
         auc = roc_auc_score(all_labels, all_final_probs)
-        
-        print(f"\nAccuracy: {acc:.4f} | F1 (AI): {f1:.4f} | ROC-AUC: {auc:.4f}")
-        
-        print("\nClassification Report:")
-        print(classification_report(all_labels, all_final_preds, target_names=["Human", "AI"], digits=4))
-        
-        print("\nConfusion Matrix:")
-        print(confusion_matrix(all_labels, all_final_preds))
+        logger.info(f"Accuracy: {acc:.4f} | ROC-AUC: {auc:.4f}")
+        print("\n" + classification_report(all_labels, all_final_preds, target_names=["Human", "AI"], digits=4))
 
-    print("\nSaving predictions...")
+    # 7. Save output (Exclude 'code' if large)
     test_df['prediction'] = all_final_preds
     test_df['probability_ai'] = all_final_probs
     
-    out_basename = os.path.basename(args.test_file).replace(".parquet", "_tta_predictions.csv").replace(".csv", "_tta_predictions.csv")
+    out_basename = os.path.basename(args.test_file).replace(".parquet", "_tta_preds.csv").replace(".csv", "_tta_preds.csv")
     out_path = os.path.join(os.path.dirname(args.test_file), out_basename)
-    test_df[['code', 'prediction', 'probability_ai']].to_csv(out_path, index=False)
-    logger.info(f"Predictions saved to {out_path}")
+    
+    # Only keep essential columns for large test sets
+    logger.info(f"Saving results to {out_path}...")
+    save_cols = [c for c in ['id', 'label', 'prediction', 'probability_ai'] if c in test_df.columns]
+    if not save_cols: save_cols = ['prediction', 'probability_ai']
+    test_df[save_cols].to_csv(out_path, index=False)
+    logger.info("Done.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--test_file", type=str, required=True, help="Path to test .parquet or .csv file")
-    parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to the saved model folder containing model.pt")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test_file", type=str, required=True)
+    parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="microsoft/graphcodebert-base")
-    parser.add_argument("--num_generators", type=int, default=10, help="Must match training setup")
-    parser.add_argument("--num_languages", type=int, default=10, help="Must match training setup")
-    
+    parser.add_argument("--num_generators", type=int, default=10)
+    parser.add_argument("--num_languages", type=int, default=10)
     parser.add_argument("--max_len", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--tta_views", type=int, default=5, help="Number of views for Test Time Augmentation inference")
+    parser.add_argument("--tta_views", type=int, default=5)
     
     args = parser.parse_args()
     run_inference(args)

@@ -34,6 +34,7 @@ ALPHA_META=0.05  # SupCon L_meta weight
 BETA=0.05        # Generator Adv weight
 GAMMA=0.05       # Language Adv weight
 GRL_SCALE=5.0    # Slower adversarial ramp
+ADV_WARMUP_EPOCHS=1 # Number of epochs to wait before starting adversarial
 
 # ==========================================
 # 2. Execution
@@ -61,6 +62,7 @@ python meta_train.py \
     --beta $BETA \
     --gamma $GAMMA \
     --grl_scale $GRL_SCALE \
+    --adv_warmup_epochs $ADV_WARMUP_EPOCHS \
     --fp16
 
 if [ -n "$RESUME_FROM" ]; then
@@ -82,6 +84,7 @@ if [ -n "$RESUME_FROM" ]; then
         --beta $BETA \
         --gamma $GAMMA \
         --grl_scale $GRL_SCALE \
+        --adv_warmup_epochs $ADV_WARMUP_EPOCHS \
         --resume_from "$RESUME_FROM" \
         --fp16
 fi

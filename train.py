@@ -86,7 +86,7 @@ def save_checkpoint(model, tokenizer, path, epoch, metrics, config):
 # 2. TRAINING ENGINE
 # -----------------------------------------------------------------------------
 def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device, 
-                   epoch_idx, acc_steps=1, supcon_fn=None):
+                   epoch_idx, acc_steps=1, supcon_fn=None, log_every=500):
     model.train()
     
     tracker = {"loss": 0.0, "task_loss": 0.0, "supcon_loss": 0.0}
@@ -130,10 +130,11 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device,
         tracker["task_loss"] += task_loss.item()
         tracker["supcon_loss"] += supcon_loss.item()
         
-        pbar.set_postfix({
-            "Loss": f"{current_loss:.3f}",
-            "SupCon": f"{supcon_loss.item():.3f}" if supcon_fn else "0.0"
-        })
+        if (step + 1) % log_every == 0:
+            pbar.set_postfix({
+                "Loss": f"{current_loss:.3f}",
+                "SupCon": f"{supcon_loss.item():.3f}" if supcon_fn else "0.0"
+            })
 
     num_batches = len(dataloader)
     return {k: v / num_batches for k, v in tracker.items()}
@@ -249,7 +250,7 @@ if __name__ == "__main__":
         # --- TRAIN ---
         train_metrics = train_one_epoch(
             model, train_dl, optimizer, scheduler, scaler, device, 
-            epoch, acc_steps, supcon_fn
+            epoch, acc_steps, supcon_fn, log_every=500
         )
         ConsoleUX.log_metrics("Train", train_metrics)
         

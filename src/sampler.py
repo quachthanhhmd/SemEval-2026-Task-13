@@ -38,14 +38,52 @@ def _build_group_index(ids: List[int]) -> Dict[int, List[int]]:
             group[gid].append(sample_idx)
     return dict(group)
 
+def _build_hierarchy_index(
+    lang_ids: List[int], 
+    label_ids: List[int], 
+    gen_ids:  List[int]
+) -> Dict[int, Dict[int, Dict[int, List[int]]]]:
+    """Map lang_id → label → generator_id → list of sample indices."""
+    # hierarchy[lang][label][gen] = [idx1, idx2, ...]
+    hierarchy: Dict[int, Dict[int, Dict[int, List[int]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+    for idx, (lid, lbl, gid) in enumerate(zip(lang_ids, label_ids, gen_ids)):
+        if lid >= 0:
+            hierarchy[lid][lbl][gid].append(idx)
+    return hierarchy
 
-def _build_group_label_index(group_ids: List[int], labels: List[int]) -> Dict[int, Dict[int, List[int]]]:
-    """Map group_id → label → list of sample indices."""
-    group: Dict[int, Dict[int, List[int]]] = defaultdict(lambda: {0: [], 1: []})
-    for sample_idx, (gid, lbl) in enumerate(zip(group_ids, labels)):
-        if gid >= 0:
-            group[gid][lbl].append(sample_idx)
-    return dict(group)
+
+def _sample_diverse(gen_dict: Dict[int, List[int]], count: int, rng: random.Random) -> List[int]:
+    """Sample 'count' indices from gen_dict {gen_id: [indices]} with diversity."""
+    if not gen_dict: return []
+    
+    # 1. Round-robin draw from available generators
+    gens = sorted(gen_dict.keys())
+    rng.shuffle(gens)
+    
+    # Copy and shuffle per-generator pools
+    pools = {g: list(indices) for g, indices in gen_dict.items()}
+    for g in pools: rng.shuffle(pools[g])
+    
+    selected = []
+    while len(selected) < count:
+        found_any = False
+        for g in gens:
+            if pools[g]:
+                selected.append(pools[g].pop())
+                found_any = True
+                if len(selected) == count: break
+        if not found_any: break
+    
+    # 2. If pool was smaller than count (rare), sample with replacement
+    if len(selected) < count:
+        all_indices = []
+        for indices in gen_dict.values(): all_indices.extend(indices)
+        if all_indices:
+            selected.extend(rng.choices(all_indices, k=count - len(selected)))
+            
+    return selected
 
 
 def _sample_group(pool: List[int], m: int, rng: random.Random) -> List[int]:
@@ -74,6 +112,7 @@ class LanguageBalancedSampler(Sampler):
         self,
         language_ids:  List[int],
         labels:        List[int],
+        generator_ids: List[int],
         k:             int  = 6,
         m:             int  = 16,
         shuffle_langs: bool = True,
@@ -87,12 +126,14 @@ class LanguageBalancedSampler(Sampler):
         self.m             = m
         self.drop_last     = drop_last
         self.shuffle_langs = shuffle_langs
-        self._rng          = random.Random(seed)
+        self._base_seed    = seed if seed is not None else random.randint(0, 10000)
+        self._rng          = random.Random(self._base_seed)
         self._epoch        = 0
 
-        self._lang_label_idx = _build_group_label_index(language_ids, labels)
-        self._valid_langs    = sorted(self._lang_label_idx.keys())
-        self._dataset_size   = len(language_ids)
+        # Build hierarchy: lang_id -> label -> generator_id -> [indices]
+        self._hierarchy    = _build_hierarchy_index(language_ids, labels, generator_ids)
+        self._valid_langs  = sorted(self._hierarchy.keys())
+        self._dataset_size = len(language_ids)
 
         if len(self._valid_langs) < 2:
             raise ValueError(f"Dataset must have at least 2 distinct languages, found {len(self._valid_langs)}")
@@ -105,38 +146,41 @@ class LanguageBalancedSampler(Sampler):
     # ------------------------------------------------------------------
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
+        self._rng.seed(self._base_seed + epoch)
 
     # ------------------------------------------------------------------
     def __iter__(self) -> Iterator[List[int]]:
         num_batches = len(self)
         
         for _ in range(num_batches):
-            # Sample k languages with replacement so it never fails even if len(valid_langs) < k
-            # But we want to ensure the batch has *distinct* languages if possible, 
-            # so we sample without replacement if we have enough, otherwise with replacement.
-            if len(self._valid_langs) >= self.k:
+            # 1. Sample k UNIQUE Languages (Tasks) 
+            # This ensures no language leakage between meta-train and meta-test blocks.
+            n_langs = len(self._valid_langs)
+            if n_langs >= self.k:
                 langs = self._rng.sample(self._valid_langs, self.k)
             else:
-                langs = self._rng.choices(self._valid_langs, k=self.k)
+                langs = list(self._valid_langs)
+                while len(langs) < self.k:
+                    langs.append(self._rng.choice(self._valid_langs))
 
             batch: List[int] = []
             for lang in langs:
-                pool_0 = self._lang_label_idx[lang][0]
-                pool_1 = self._lang_label_idx[lang][1]
+                # 2. Build Language Block (m/2 AI, m/2 Human)
+                m_pos = self.m // 2
+                m_neg = self.m - m_pos
 
-                m_0 = self.m // 2
-                m_1 = self.m - m_0
+                # Specific generators within this language for diversity
+                group_1 = self._hierarchy[lang][1] # dict: gen -> [indices]
+                group_0 = self._hierarchy[lang][0] # dict: gen -> [indices]
 
-                # If a language is missing one of the labels entirely, 
-                # fallback to taking all m samples from the available label
-                if len(pool_0) == 0 or len(pool_1) == 0:
-                    combined = pool_0 + pool_1
-                    batch.extend(_sample_group(combined, self.m, self._rng))
-                else:
-                    batch.extend(_sample_group(pool_0, m_0, self._rng))
-                    batch.extend(_sample_group(pool_1, m_1, self._rng))
+                indices_pos = _sample_diverse(group_1, m_pos, self._rng)
+                indices_neg = _sample_diverse(group_0, m_neg, self._rng)
+                
+                block = indices_pos + indices_neg
+                self._rng.shuffle(block)
+                batch.extend(block)
 
-            # Preserve per-language grouping in the output list
+            # CRITICAL: Keep language blocks contiguous for Trainer.split_meta_language
             yield batch
 
     # ------------------------------------------------------------------
@@ -175,7 +219,8 @@ class DomainBalancedSampler(Sampler):
         self.m              = m
         self.drop_last      = drop_last
         self.shuffle_domains = shuffle_domains
-        self._rng           = random.Random(seed)
+        self._base_seed     = seed if seed is not None else random.randint(0, 10000)
+        self._rng           = random.Random(self._base_seed)
         self._epoch         = 0
 
         self._domain_to_indices = _build_group_index(domain_ids)
@@ -187,20 +232,25 @@ class DomainBalancedSampler(Sampler):
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
+        self._rng.seed(self._base_seed + epoch)
 
     def __iter__(self) -> Iterator[List[int]]:
         num_batches = len(self)
         for _ in range(num_batches):
-            if len(self._valid_domains) >= self.k:
+            n_doms = len(self._valid_domains)
+            if n_doms >= self.k:
                 domains = self._rng.sample(self._valid_domains, self.k)
             else:
-                domains = self._rng.choices(self._valid_domains, k=self.k)
+                domains = list(self._valid_domains)
+                while len(domains) < self.k:
+                    domains.append(self._rng.choice(self._valid_domains))
             
             batch: List[int] = []
             for d in domains:
                 batch.extend(
                     _sample_group(self._domain_to_indices[d], self.m, self._rng)
                 )
+            self._rng.shuffle(batch)
             yield batch
 
     def __len__(self) -> int:

@@ -31,6 +31,7 @@ import random
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -81,7 +82,8 @@ def split_meta_language(
     # Last language in the batch is the meta_test language
     meta_test_lang = unique_langs[-1]
 
-    test_mask  = torch.tensor([l == meta_test_lang for l in lang_ids])
+    device = batch["language_id"].device
+    test_mask  = torch.tensor([l == meta_test_lang for l in lang_ids], device=device)
     train_mask = ~test_mask
 
     if train_mask.sum() == 0 or test_mask.sum() == 0:
@@ -90,7 +92,7 @@ def split_meta_language(
     def _select(m: torch.Tensor) -> Dict[str, torch.Tensor]:
         return {k: v[m] for k, v in batch.items()}
 
-    return _select(train_mask), _select(test_mask), meta_test_lang
+    return _select(train_mask), _select(test_mask), int(meta_test_lang)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,8 @@ class MetaTrainer:
         log_every:      int   = 20,
         checkpoint_dir: str   = "checkpoints",
         use_wandb:      bool  = False,
+        adv_warmup_epochs: int = 1,
+        adv_warmup_steps: int = 0,
     ) -> None:
         self.model          = model
         self.train_loader   = train_loader
@@ -179,6 +183,11 @@ class MetaTrainer:
         self.log_every      = log_every
         self.checkpoint_dir = checkpoint_dir
         self.use_wandb      = use_wandb
+        self.adv_warmup_epochs = adv_warmup_epochs
+        self.adv_warmup_steps  = adv_warmup_steps
+        self.current_epoch  = 0
+        self.eff_warmup_steps = 0  # Unified threshold
+        self.current_epoch  = 0
 
         self.scaler    = GradScaler("cuda", enabled=self.fp16)
         self.supcon_fn = SupConLoss(temperature=0.07).to(device)
@@ -198,7 +207,19 @@ class MetaTrainer:
                 logger.warning("wandb not installed; using TensorBoard only.")
 
         self.global_step = 0
+        self.total_steps = 0  # To be set in train()
         self.best_f1     = 0.0
+        self.history_path = os.path.join(self.checkpoint_dir, "history.csv")
+        self._init_history()
+
+    def _init_history(self) -> None:
+        """Initialize history CSV if it doesn't exist."""
+        if not os.path.exists(self.history_path):
+            with open(self.history_path, "w", encoding="utf-8") as f:
+                # Basic columns
+                cols = ["epoch", "step", "lr", "lam"]
+                # Placeholders for metrics (will be added dynamically)
+                f.write(",".join(cols) + "\n")
 
     # ------------------------------------------------------------------
     def _to(self, batch: Dict) -> Dict[str, torch.Tensor]:
@@ -209,11 +230,14 @@ class MetaTrainer:
         self,
         batch:  Dict[str, torch.Tensor],
         params: Optional[Dict[str, torch.Tensor]] = None,
+        buffers: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Forward pass — uses functional_call if params (θ') are given."""
         if params is not None:
+            # Use current model buffers if none provided
+            b = buffers if buffers is not None else dict(self.model.named_buffers())
             return self.model.forward_with_params(
-                batch["input_ids"], batch["attention_mask"], batch["entropy"], params
+                batch["input_ids"], batch["attention_mask"], batch["entropy"], params, buffers=b
             )
         return self.model(batch["input_ids"], batch["attention_mask"], batch["entropy"])
 
@@ -222,9 +246,13 @@ class MetaTrainer:
         self,
         batch:  Dict[str, torch.Tensor],
         params: Optional[Dict[str, torch.Tensor]] = None,
+        buffers: Optional[Dict[str, torch.Tensor]] = None,
+        beta:   Optional[float] = None,
+        gamma:  Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Full L_train = L_label + α·L_con + β·L_gen + γ·L_lang."""
-        out = self._forward(batch, params)
+        out = self._forward(batch, params, buffers)
+        
         total, breakdown = compute_total_loss(
             label_logits     = out["label_logits"],
             generator_logits = out["generator_logits"],
@@ -234,9 +262,7 @@ class MetaTrainer:
             generator_ids    = batch["generator_id"],
             language_ids     = batch["language_id"],
             supcon_fn        = self.supcon_fn,
-            alpha            = self.alpha,
-            beta             = self.beta,
-            gamma            = self.gamma,
+            gamma            = gamma if gamma is not None else self.gamma
         )
         return total, breakdown
 
@@ -245,14 +271,16 @@ class MetaTrainer:
         self,
         batch:  Dict[str, torch.Tensor],
         params: Dict[str, torch.Tensor],
+        buffers: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """
-        L_meta = L_label + alpha_meta * L_contrastive   (fix #2)
+        L_meta = L_label + alpha_meta * L_contrastive
         No adversarial terms in meta-test step.
         """
-        out = self._forward(batch, params)
+        out = self._forward(batch, params, buffers)
         L_label = F.cross_entropy(out["label_logits"], batch["label"])
-        # Contrastive on the projection using label as positive signal
+        
+        # Use pure binary labels for meta-test contrastive: AI vs Human invariant
         L_con   = self.supcon_fn(out["projection"], batch["label"])
         return L_label + self.alpha_meta * L_con
 
@@ -264,13 +292,20 @@ class MetaTrainer:
     ) -> Dict[str, float]:
         """One FOMAML meta-training step."""
 
-        # ---- GRL λ (fix #6: scale=5.0) ----
-        lam = grl_lambda_schedule(self.global_step, total_steps, self.grl_scale)
-        self.model.set_lambda(lam)
+        # ---- GRL λ schedule (global step based) ----
+        lam = grl_lambda_schedule(self.global_step, self.total_steps, self.grl_scale)
 
-        # ---- Leave-One-Language split (fix #1 & #7) ----
+        # ---- Smooth Adversarial Warmup: scale weights by lam ----
+        is_warmup = (self.global_step < self.eff_warmup_steps)
+        eff_lam   = 0.0 if is_warmup else lam
+        eff_beta  = 0.0 if is_warmup else self.beta * lam
+        eff_gamma = 0.0 if is_warmup else self.gamma * lam
+        self.model.set_lambda(eff_lam)
+
+        # ---- Leave-One-Language split ----
         meta_train_batch, meta_test_batch, _ = split_meta_language(batch)
-        use_meta = (meta_train_batch is not None)
+        # Skip meta step if meta-test is too small for stable contrastive
+        use_meta = (meta_train_batch is not None and meta_test_batch["label"].shape[0] >= 4)
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -281,55 +316,84 @@ class MetaTrainer:
             meta_train_batch = self._to(meta_train_batch)
             meta_test_batch  = self._to(meta_test_batch)
 
-            # ---- Inner step ----
-            # Freeze encoder in FOMAML inner loop for meta stability
-            param_names  = [
-                n for n, p in self.model.named_parameters() 
-                if p.requires_grad and not n.startswith("encoder")
-            ]
-            named_params = {
-                n: p for n, p in self.model.named_parameters() 
-                if p.requires_grad and not n.startswith("encoder")
-            }
+            # Params + Buffers for functional call
+            param_names  = [n for n, p in self.model.named_parameters() if p.requires_grad]
+            named_params = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
+            named_buffers = dict(self.model.named_buffers())
 
+            # Step 1: Inner Adaptation Pass (Classification only)
+            # We run a dedicated forward pass for θ' and use autocast=False for grad stability
+            with autocast(device_type=self.device.type, enabled=False):
+                out_inner = self.model(
+                    meta_train_batch["input_ids"], 
+                    meta_train_batch["attention_mask"], 
+                    meta_train_batch["entropy"]
+                )
+                
+                L_label_inner = F.cross_entropy(out_inner["label_logits"], meta_train_batch["label"])
+                # Inner Adaptation: Optimize for pure AI vs Human invariant
+                L_con_inner = self.supcon_fn(out_inner["projection"], meta_train_batch["label"])
+                L_inner = L_label_inner + self.alpha * L_con_inner
+
+            # FOMAML Inner Step: Derive θ' from classification task only
+            # create_graph=False as we don't do second-order derivs in FO-MAML
+            grads = torch.autograd.grad(L_inner, list(named_params.values()), create_graph=False, allow_unused=True)
+            grads = tuple(g if g is not None else torch.zeros_like(p) for g, p in zip(grads, named_params.values()))
+            theta_prime = functional_params_update(named_params, grads, param_names, self.lr_inner)
+
+            # Step 2: Outer/Final Pass (Full Regularization + Meta-Test)
+            # This is the "real" update pass using θ and θ'. 
+            # We run it under GradScaler/AMP if enabled.
             with autocast(device_type=self.device.type, enabled=self.fp16):
-                L_train, breakdown = self._compute_train_loss(meta_train_batch)
+                # A) Loss on Meta-Train using base θ (Full Adversarial Regularization)
+                out_outer = self._forward(meta_train_batch)
+                L_train, breakdown = compute_total_loss(
+                    label_logits     = out_outer["label_logits"],
+                    generator_logits = out_outer["generator_logits"],
+                    language_logits  = out_outer["language_logits"],
+                    projection       = out_outer["projection"],
+                    labels           = meta_train_batch["label"],
+                    generator_ids    = meta_train_batch["generator_id"],
+                    language_ids     = meta_train_batch["language_id"],
+                    supcon_fn        = self.supcon_fn,
+                    alpha            = self.alpha,
+                    beta             = eff_beta,
+                    gamma            = eff_gamma
+                )
 
-            # FOMAML: create_graph=False  (fix #3)
-            grads = torch.autograd.grad(
-                L_train,
-                [named_params[n] for n in param_names],
-                create_graph=False,   # << FOMAML key change
-                allow_unused=True,
-            )
-            grads = tuple(
-                g if g is not None else torch.zeros_like(named_params[n])
-                for g, n in zip(grads, param_names)
-            )
-
-            theta_prime = functional_params_update(
-                named_params, grads, param_names, self.lr_inner
-            )
-
-            # ---- Meta step: L_label + 0.3 * L_contrastive (fix #2) ----
+            # Meta step
             with autocast(device_type=self.device.type, enabled=self.fp16):
-                L_meta = self._compute_meta_loss(meta_test_batch, theta_prime)
+                L_meta = self._compute_meta_loss(meta_test_batch, theta_prime, named_buffers)
 
             L_final = L_train + self.delta * L_meta
 
         # ----------------------------------------------------------------
-        # Case B: only one language in batch — standard training step
+        # Case B: meta split failed — Standard training (No inner loop)
         # ----------------------------------------------------------------
         else:
             batch = self._to(batch)
             with autocast(device_type=self.device.type, enabled=self.fp16):
-                L_final, breakdown = self._compute_train_loss(batch)
+                # Forward pass on full batch
+                out = self._forward(batch)
+                L_final, breakdown = compute_total_loss(
+                    label_logits     = out["label_logits"],
+                    generator_logits = out["generator_logits"],
+                    language_logits  = out["language_logits"],
+                    projection       = out["projection"],
+                    labels           = batch["label"],
+                    generator_ids    = batch["generator_id"],
+                    language_ids     = batch["language_id"],
+                    supcon_fn        = self.supcon_fn,
+                    alpha            = self.alpha,
+                    beta             = eff_beta,
+                    gamma            = eff_gamma
+                )
             L_meta = torch.tensor(0.0, device=self.device)
 
         # ---- Backward & update ----
         self.scaler.scale(L_final).backward()
         self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
         if self.scheduler is not None:
@@ -338,25 +402,58 @@ class MetaTrainer:
         log = {k: v.item() for k, v in breakdown.items()}
         log["L_meta"]  = L_meta.item()
         log["L_final"] = L_final.item()
-        log["grl_lam"] = lam
+        log["grl_lam"] = eff_lam
         return log
 
     # ------------------------------------------------------------------
-    def train(self, num_epochs: int, start_epoch: int = 1) -> None:
-        # ==============================================================
+    def train(self, num_epochs: int = 0, num_steps: int = 0, start_epoch: int = 1) -> None:
         self.model.train()
-        epoch_logs: Dict[str, float] = defaultdict(float) # Changed from epoch_losses to epoch_logs and defaultdict
-        total_steps = len(self.train_loader) * num_epochs # Using num_epochs as parameter
+        # Selective Unfreezing: Keep layers 8-11 trainable for meta-adaptation
+        # GraphCodeBERT has 12 layers (0-11). Freezing the first 8 layers preserves 
+        # base features while allowing the top 4 layers to adapt.
+        for name, param in self.model.encoder.named_parameters():
+            if any(f"encoder.layer.{i}" in name for i in [8, 9, 10, 11]):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        
+        steps_per_epoch = len(self.train_loader)
+        
+        if num_epochs > 0:
+            total_steps = num_epochs * steps_per_epoch
+            # Warmup: use epochs if specified, else steps
+            if self.adv_warmup_epochs > 0:
+                self.eff_warmup_steps = self.adv_warmup_epochs * steps_per_epoch
+            else:
+                self.eff_warmup_steps = self.adv_warmup_steps
+        else:
+            total_steps = num_steps
+            self.eff_warmup_steps = self.adv_warmup_steps
 
-        # For debugging: we want to inspect the first 3 batches
+        self.total_steps = total_steps
+
+        # Adjust start if needed
+        actual_start_epoch = start_epoch - 1
+        
+        logger.info(
+            "Training setup: total_steps=%d | warmup_steps=%d",
+            total_steps, self.eff_warmup_steps
+        )
+
         saved_debug_batches = 0
 
-        for epoch in range(start_epoch, num_epochs + 1): 
-            logger.info("Epoch %d/%d", epoch, num_epochs)
-            if hasattr(self.train_loader.batch_sampler, "set_epoch"): # Changed to batch_sampler
+        for epoch in range(actual_start_epoch, num_epochs if num_epochs > 0 else 10000):
+            if num_steps > 0 and self.global_step >= num_steps:
+                break
+                
+            self.current_epoch = epoch
+            logger.info("Epoch %d (Step %d)", epoch + 1, self.global_step)
+            epoch_logs: Dict[str, float] = defaultdict(float)
+
+            if hasattr(self.train_loader.batch_sampler, "set_epoch"):
                 self.train_loader.batch_sampler.set_epoch(epoch)
 
-            pbar = tqdm(self.train_loader, desc=f"Train E{epoch}") # Different desc
+            pbar = tqdm(self.train_loader, desc=f"Train E{epoch+1}")
             for step, batch in enumerate(pbar): # Added enumerate and step
                 # --- Debug Batch Saving ---
                 if epoch == 1 and saved_debug_batches < 3:
@@ -388,13 +485,9 @@ class MetaTrainer:
 
                 if self.global_step % self.log_every == 0:
                     self._log(step_log, prefix="train/step")
-
-                pbar.set_postfix({
-                    "L_total": f"{step_log['L_total']:.3f}",
-                    "L_label": f"{step_log['L_label']:.3f}",
-                    "L_meta":  f"{step_log['L_meta']:.3f}",
-                    "λ":       f"{step_log['grl_lam']:.3f}",
-                })
+                    # Dynamic log string from breakdown keys
+                    msg = " ".join([f"{k.split('_')[-1]}={step_log[k]:.3f}" for k in step_log if k.startswith("L_")])
+                    pbar.set_postfix_str(f"{msg} lam={step_log['grl_lam']:.3f}")
 
             n_steps = len(self.train_loader)
             avg_log = {k: v / n_steps for k, v in epoch_logs.items()}
@@ -402,17 +495,18 @@ class MetaTrainer:
             logger.info(
                 "[Epoch %d] L_total=%.4f  L_label=%.4f  L_con=%.4f  "
                 "L_gen=%.4f  L_lang=%.4f  L_meta=%.4f",
-                epoch + 1,
+                epoch,
                 avg_log.get("L_total", 0), avg_log.get("L_label", 0),
                 avg_log.get("L_contrastive", 0), avg_log.get("L_generator", 0),
                 avg_log.get("L_language", 0), avg_log.get("L_meta", 0),
             )
 
             val_metrics = self.evaluate()
+            self._save_history(epoch, val_metrics)
             self._log(val_metrics, prefix="val/epoch", step=epoch)
             logger.info(
                 "[Val   %d] acc=%.4f  f1=%.4f  roc_auc=%.4f",
-                epoch + 1,
+                epoch,
                 val_metrics["accuracy"], val_metrics["f1"],
                 val_metrics.get("roc_auc", -1.0),
             )
@@ -443,11 +537,16 @@ class MetaTrainer:
 
         metrics: Dict[str, float] = {
             "accuracy": accuracy_score(all_labels, all_preds),
-            "f1":       f1_score(all_labels, all_preds, average="binary", zero_division=0),
+            "f1": f1_score(all_labels, all_preds, average="macro", zero_division=0),
         }
         try:
+            # Handle both binary and multi-class AUC
+            if len(np.unique(all_labels)) > 2:
+                # Need one-hot probs for multi-class AUC
+                # For now assume mostly binary code detection
+                pass
             metrics["roc_auc"] = roc_auc_score(all_labels, all_probs)
-        except ValueError:
+        except Exception:
             metrics["roc_auc"] = 0.0
 
         self.model.train()
@@ -460,6 +559,26 @@ class MetaTrainer:
             self.writer.add_scalar(f"{prefix}/{k}", v, s)
         if self._wandb is not None:
             self._wandb.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=s)
+
+    # ------------------------------------------------------------------
+    def _save_history(self, epoch: int, metrics: Dict[str, float]) -> None:
+        """Append epoch metrics to CSV."""
+        import pandas as pd
+        lr = self.optimizer.param_groups[0]["lr"]
+        # Use stored total_steps for consistent lam in history
+        lam = grl_lambda_schedule(self.global_step, self.total_steps, self.grl_scale)
+        
+        row = {"epoch": epoch, "step": self.global_step, "lr": lr, "lam": lam}
+        row.update(metrics)
+        
+        df = pd.DataFrame([row])
+        # Reorder to keep epoch/step first
+        cols = ["epoch", "step", "lr", "lam"]
+        other_cols = [c for c in df.columns if c not in cols]
+        df = df[cols + other_cols]
+        
+        header = not os.path.exists(self.history_path) or os.path.getsize(self.history_path) == 0
+        df.to_csv(self.history_path, mode="a", index=False, header=header)
 
     # ------------------------------------------------------------------
     def _save_checkpoint(self, epoch: int, metrics: Dict[str, float]) -> None:

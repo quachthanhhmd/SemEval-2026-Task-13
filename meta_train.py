@@ -34,6 +34,7 @@ from src.dataset import build_datasets
 from src.model   import GraphCodeBERTDomainModel
 from src.sampler  import LanguageBalancedSampler, domain_collate_fn
 from src.trainer  import MetaTrainer
+from src.visualization import save_training_plots
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -97,7 +98,10 @@ def parse_args() -> argparse.Namespace:
                    help="Samples per language per batch")
 
     # ---- Training ----
-    p.add_argument("--epochs",      type=int,   default=3)
+    p.add_argument("--epochs",      type=int,   default=3,
+                   help="Number of epochs (if >0, overrides num_steps)")
+    p.add_argument("--num_steps",   type=int,   default=0,
+                   help="Number of steps (used if epochs=0)")
     p.add_argument("--lr",          type=float, default=2e-5)
     p.add_argument("--lr_inner",    type=float, default=5e-5,
                    help="Inner-loop learning rate for MAML θ' update")
@@ -128,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints/meta_training")
     p.add_argument("--resume_from",  type=str, default=None,
                    help="Path to checkpoint directory to resume training from")
-    p.add_argument("--log_every",    type=int, default=20,
+    p.add_argument("--log_every",    type=int, default=500,
                    help="Log every N global steps")
     p.add_argument("--use_wandb",    action="store_true",
                    help="Enable Weights & Biases logging")
@@ -136,6 +140,18 @@ def parse_args() -> argparse.Namespace:
                    help="W&B project name")
     p.add_argument("--wandb_run_name",type=str, default=None,
                    help="W&B run name")
+
+    # ---- Experiment Mode ----
+    p.add_argument("--experiment_mode", type=str, default="full",
+                   choices=["debug", "fast_dev", "strong_dev", "full"],
+                   help="debug=5k, fast_dev=50k, strong_dev=100k, full=all")
+    p.add_argument("--val_strategy",    type=str, default="standard_random",
+                   choices=["standard_random", "leave_language_out", "leave_generator_out"],
+                   help="Validation strategy for OOD evaluation")
+    p.add_argument("--adv_warmup_epochs", type=int, default=1,
+                   help="Warmup epochs (if >0, overrides adv_warmup_steps)")
+    p.add_argument("--adv_warmup_steps", type=int, default=0,
+                   help="Warmup steps (used if adv_warmup_epochs=0)")
 
     return p.parse_args()
 
@@ -174,6 +190,10 @@ def main() -> None:
         tokenizer          = tokenizer,
         max_length         = args.max_len,
         registry_save_path = args.registry_path,
+        experiment_mode    = args.experiment_mode,
+        val_strategy       = args.val_strategy,
+        holdout_value      = args.holdout_value,
+        seed               = args.seed,
     )
 
     # ----------------------------------------------------------------
@@ -182,6 +202,7 @@ def main() -> None:
     train_sampler = LanguageBalancedSampler(
         language_ids  = train_ds.language_ids_list,
         labels        = train_ds.labels_list,
+        generator_ids = train_ds.generator_ids_list,
         k             = args.k_langs,
         m             = args.m_per_lang,
         shuffle_langs = True,
@@ -290,6 +311,8 @@ def main() -> None:
         log_every      = args.log_every,
         checkpoint_dir = args.checkpoint_dir,
         use_wandb      = args.use_wandb,
+        adv_warmup_epochs = args.adv_warmup_epochs,
+        adv_warmup_steps  = args.adv_warmup_steps,
     )
 
     # ----------------------------------------------------------------
@@ -300,7 +323,18 @@ def main() -> None:
         start_epoch = trainer.load_checkpoint(args.resume_from)
 
     logger.info("Starting training loop ...")
-    trainer.train(num_epochs=args.epochs, start_epoch=start_epoch)
+    trainer.train(
+        num_epochs  = args.epochs,
+        num_steps   = args.num_steps,
+        start_epoch = start_epoch
+    )
+
+    # ----------------------------------------------------------------
+    # 8. Visualization
+    # ----------------------------------------------------------------
+    logger.info("Generating training summary plots ...")
+    save_training_plots(trainer.history_path, args.checkpoint_dir)
+    logger.info("All done.")
 
     if args.use_wandb:
         try:

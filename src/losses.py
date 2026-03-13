@@ -126,16 +126,7 @@ class SupConLoss(nn.Module):
         # Mask of positive pairs
         labels_col = labels.unsqueeze(1)  # [B, 1]
         labels_row = labels.unsqueeze(0)  # [1, B]
-        pos_mask = (labels_col == labels_row)
-
-        if language_ids is not None:
-            lang_col = language_ids.unsqueeze(1)
-            lang_row = language_ids.unsqueeze(0)
-            # Positive pair must be same label AND different language wrapper
-            diff_lang_mask = (lang_col != lang_row)
-            pos_mask = pos_mask & diff_lang_mask
-
-        pos_mask = pos_mask.float()
+        pos_mask = (labels_col == labels_row).float()
 
         # Remove diagonal (self similarity)
         diag_mask = torch.eye(B, device=device)
@@ -170,9 +161,9 @@ def compute_total_loss(
     generator_ids:    torch.Tensor,
     language_ids:     torch.Tensor,
     supcon_fn:        SupConLoss,
-    alpha:  float = 0.5,
-    beta:   float = 0.1,
-    gamma:  float = 0.1,
+    alpha: float = 0.5,
+    beta:  float = 0.1,
+    gamma: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Compute:
@@ -188,8 +179,8 @@ def compute_total_loss(
 
     L_label = ce(label_logits, labels)
 
-    # Contrastive on L2-normed projections
-    L_con = supcon_fn(projection, labels, language_ids=language_ids)
+    # 2. Contrastive Loss (AI vs Human Invariant)
+    L_con = supcon_fn(projection, labels)
 
     # Adversarial losses (GRL already reversed the gradient inside the model)
     L_gen  = ce(generator_logits, generator_ids) if generator_ids.min() >= 0 else torch.tensor(0.0, device=labels.device)
