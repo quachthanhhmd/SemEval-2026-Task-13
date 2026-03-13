@@ -183,7 +183,19 @@ def run_inference(args):
     )
     
     logger.info(f"Loading weights from {state_dict_path}")
-    model.load_state_dict(torch.load(state_dict_path, map_location="cpu"))
+    state_dict = torch.load(state_dict_path, map_location="cpu")
+    
+    # Filter out domain heads as they might mismatch in size and aren't used for inference
+    filtered_state_dict = {
+        k: v for k, v in state_dict.items() 
+        if "generator_head" not in k and "language_head" not in k
+    }
+    
+    missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+    if missing:
+        logger.info(f"Missing keys (expected for domain heads): {missing}")
+    if unexpected:
+        logger.warning(f"Unexpected keys in checkpoint: {unexpected}")
     model.to(device)
     model.eval()
 
