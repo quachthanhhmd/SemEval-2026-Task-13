@@ -499,8 +499,12 @@ class MetaTrainer:
                     print(
                         f"Epoch {epoch+1} | "
                         f"step {self.global_step}/{self.total_steps} | "
-                        f"loss={step_log['L_final']:.4f} | "
-                        f"meta={step_log['L_meta']:.4f} | "
+                        f"L={step_log['L_final']:.4f} | "
+                        f"label={step_log.get('L_label', 0):.3f} | "
+                        f"con={step_log.get('L_contrastive', 0):.3f} | "
+                        f"gen={step_log.get('L_generator', 0):.3f} | "
+                        f"lang={step_log.get('L_language', 0):.3f} | "
+                        f"meta={step_log['L_meta']:.3f} | "
                         f"lam={step_log['grl_lam']:.3f} | "
                         f"ETA {eta_str}"
                     )
