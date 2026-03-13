@@ -14,7 +14,7 @@ CHECKPOINT_DIR="checkpoints/meta_training/best_model" # Point to the saved model
 
 # Inference settings
 BATCH_SIZE=32
-MAX_LEN=512
+MAX_LEN=256
 TTA_VIEWS=5  # Number of Test-Time Augmentations (spans) per sequence
 
 # Model Architecture Configuration (Should match training)

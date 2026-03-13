@@ -25,7 +25,7 @@ def test_pipeline():
     model = GraphCodeBERTDomainModel(
         num_generators=5,
         num_languages=10,
-        num_style=11,
+        num_style=10,
         model_name="microsoft/graphcodebert-base"
     ).to(device)
     
@@ -33,7 +33,7 @@ def test_pipeline():
     max_len = 128
     input_ids = torch.randint(0, 30000, (batch_size, max_len)).to(device)
     attention_mask = torch.ones((batch_size, max_len)).to(device)
-    extra_features = torch.randn((batch_size, 11)).to(device)
+    extra_features = torch.randn((batch_size, 10)).to(device)
     
     out = model(input_ids, attention_mask, extra_features)
     
@@ -70,7 +70,7 @@ def test_pipeline():
     logger.info(f"Dataset sample keys: {sample.keys()}")
     assert "input_ids" in sample
     assert "extra_features" in sample
-    assert sample["extra_features"].shape == (11,)
+    assert sample["extra_features"].shape == (10,)
     logger.info("Dataset Logic Success!")
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ if project_root not in sys.path:
 
 from src.dataset import build_datasets, CodeDataset, identifier_entropy, multi_span, random_span
 from src.model   import GraphCodeBERTDomainModel
+from src.features import AgnosticFeatureExtractor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,9 +53,10 @@ class TTACodeDataset(torch.utils.data.Dataset):
     Dataset that applies span sampling at test time (TTA).
     Returns `tta_views` number of differently sampled views for the same code.
     """
-    def __init__(self, df, tokenizer, max_length=512, tta_views=5):
+    def __init__(self, df, tokenizer, extractor=None, max_length=512, tta_views=5):
         self.dataset   = df.to_dict('records') if isinstance(df, pd.DataFrame) else df
         self.tokenizer = tokenizer
+        self.extractor = extractor
         self.max_len   = max_length
         self.tta_views = tta_views
 
@@ -66,8 +68,18 @@ class TTACodeDataset(torch.utils.data.Dataset):
         code = str(row["code"])
         label = int(row.get("label", 0))
 
-        # Entropy is invariant to span sampling since it evaluates the whole sequence
-        entropy = identifier_entropy(code)
+        # 1. Stylometric Features (10 features)
+        if self.extractor is not None:
+            raw_features = self.extractor.extract_all(code)
+            extra_features = torch.tensor(raw_features, dtype=torch.float)
+            # Log normalization for unbounded features (0: avg_id_len, 6: line_std)
+            for i in [0, 6]:
+                extra_features[i] = torch.log1p(extra_features[i])
+            extra_features = torch.clamp(extra_features, min=0.0, max=100.0)
+        else:
+            entropy = identifier_entropy(code)
+            extra_features = torch.zeros(10, dtype=torch.float)
+            extra_features[1] = entropy 
 
         # Baseline tokenize (no truncation yet)
         enc = self.tokenizer(code, add_special_tokens=True, truncation=False, return_tensors=None)
@@ -102,7 +114,7 @@ class TTACodeDataset(torch.utils.data.Dataset):
         return {
             "views": views,  # List of dicts, length = tta_views
             "label": torch.tensor(label, dtype=torch.long),
-            "entropy": torch.tensor(entropy, dtype=torch.float),
+            "extra_features": extra_features,
             "idx": idx,
         }
 
@@ -119,7 +131,7 @@ def tta_collate_fn(batch):
     return {
         "views": views_collated, # List of Batched Inputs
         "label": torch.stack([item["label"] for item in batch]),
-        "entropy": torch.stack([item["entropy"] for item in batch]),
+        "extra_features": torch.stack([item["extra_features"] for item in batch]),
         "idx": [item["idx"] for item in batch],
     }
 
@@ -157,6 +169,7 @@ def run_inference(args):
     model = GraphCodeBERTDomainModel(
         num_generators = args.num_generators, 
         num_languages  = args.num_languages,
+        num_style      = 10,
         model_name     = args.model_name,
     )
     
@@ -166,7 +179,8 @@ def run_inference(args):
     model.eval()
 
     # 4. DataLoader
-    dataset = TTACodeDataset(test_df, tokenizer, max_length=args.max_len, tta_views=args.tta_views)
+    extractor = AgnosticFeatureExtractor()
+    dataset = TTACodeDataset(test_df, tokenizer, extractor=extractor, max_length=args.max_len, tta_views=args.tta_views)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=tta_collate_fn)
 
     # 5. Prediction Loop with TTA
@@ -178,19 +192,18 @@ def run_inference(args):
         saved_debug_batches = 0
         for step, batch in enumerate(tqdm(dataloader, desc="Inferencing")):
             views = batch["views"]
-            batch_entropy = batch["entropy"].to(device)
+            extra_features = batch["extra_features"].to(device)
 
             # --- Debug Batch Saving ---
             if saved_debug_batches < 3:
                 try:
-                    import pandas as pd
                     # Just save the first view for debugging the tokens
                     first_view = views[0]
                     b_dict = {
                         "input_ids": first_view["input_ids"].cpu().numpy().tolist(),
                         "label": batch["label"].cpu().numpy().tolist(),
-                        "entropy": batch["entropy"].cpu().numpy().tolist(),
-                        "idx": batch["idx"]
+                        "entropy": batch["extra_features"][:, 1].cpu().numpy().tolist(), # entropy is at index 1
+                        "idx": batch["idx"] # idx is already a list
                     }
                     df_debug = pd.DataFrame(b_dict)
                     debug_path = os.path.join(args.checkpoint_dir, f"debug_inference_batch_{saved_debug_batches}.csv")
@@ -207,7 +220,7 @@ def run_inference(args):
                 input_ids = v_data["input_ids"].to(device)
                 mask = v_data["attention_mask"].to(device)
                 
-                out = model(input_ids, mask, batch_entropy)
+                out = model(input_ids, mask, extra_features)
                 # Softmax to get probabilities
                 probs = F.softmax(out["label_logits"], dim=-1)
                 view_probs.append(probs)
@@ -261,8 +274,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to the saved model folder containing model.pt")
     
     parser.add_argument("--model_name", type=str, default="microsoft/graphcodebert-base")
-    parser.add_argument("--num_generators", type=int, default=10, help="Must match training setup")
-    parser.add_argument("--num_languages", type=int, default=10, help="Must match training setup")
+    parser.add_argument("--num_generators", type=int, default=35, help="Must match training setup")
+    parser.add_argument("--num_languages", type=int, default=3, help="Must match training setup")
     
     parser.add_argument("--max_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=32)
