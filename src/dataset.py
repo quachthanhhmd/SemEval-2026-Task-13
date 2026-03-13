@@ -455,7 +455,6 @@ class ExperimentConfig:
     """
     mode:          Literal["debug", "fast_dev", "strong_dev", "full"] = "full"
     val_strategy:  Literal["standard_random", "leave_language_out", "leave_generator_out"] = "standard_random"
-    holdout_value: Optional[str] = None
     val_ratio:     float         = 0.1
     seed:          int           = 42
 
@@ -502,7 +501,6 @@ def stratified_sample(
 def split_ood_validation(
     df:            pd.DataFrame,
     strategy:      str,
-    holdout_value: Optional[str],
     val_ratio:     float = 0.1,
     seed:          int   = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -510,24 +508,18 @@ def split_ood_validation(
     Returns (train_df, val_df) based on the specified validation strategy.
     """
     if strategy == "leave_language_out":
-        if not holdout_value:
-            langs = df["language"].unique().tolist()
-            holdout_value = langs[0]
-            logger.warning("No holdout_value specified; auto-selecting: %s", holdout_value)
-        val_df   = df[df["language"] == holdout_value].reset_index(drop=True)
-        train_df = df[df["language"] != holdout_value].reset_index(drop=True)
-        if len(val_df) == 0:
-            raise ValueError(f"No samples found for language '{holdout_value}'")
+        langs = sorted(df["language"].unique().tolist())
+        target = langs[0]
+        logger.info("Leave-Language-Out val strategy: holding out '%s'", target)
+        val_df   = df[df["language"] == target].reset_index(drop=True)
+        train_df = df[df["language"] != target].reset_index(drop=True)
 
     elif strategy == "leave_generator_out":
-        if not holdout_value:
-            gens = df["generator"].unique().tolist()
-            holdout_value = gens[0]
-            logger.warning("No holdout_value specified; auto-selecting: %s", holdout_value)
-        val_df   = df[df["generator"] == holdout_value].reset_index(drop=True)
-        train_df = df[df["generator"] != holdout_value].reset_index(drop=True)
-        if len(val_df) == 0:
-            raise ValueError(f"No samples found for generator '{holdout_value}'")
+        gens = sorted(df["generator"].unique().tolist())
+        target = gens[0]
+        logger.info("Leave-Generator-Out val strategy: holding out '%s'", target)
+        val_df   = df[df["generator"] == target].reset_index(drop=True)
+        train_df = df[df["generator"] != target].reset_index(drop=True)
 
     else:  # standard_random
         val_df   = df.sample(frac=val_ratio, random_state=seed).reset_index(drop=True)
@@ -565,7 +557,6 @@ def build_datasets(
     # Experiment parameters (new, all optional for backward compat)
     experiment_mode:    str = "full",
     val_strategy:       str = "standard_random",
-    holdout_value:      Optional[str] = None,
     val_ratio:          float = 0.1,
     seed:               int = 42,
 ) -> Tuple[CodeDataset, CodeDataset, DomainRegistry]:
@@ -578,15 +569,13 @@ def build_datasets(
         Automatically subsets training data for faster experiments.
     val_strategy : {"standard_random", "leave_language_out", "leave_generator_out"}
         Validation data selection strategy.
-    holdout_value : str or None
-        Language or generator name to hold out (for OOD val strategies).
     val_ratio : float
         Fraction used for standard_random val split.
     seed : int
         Random seed for reproducibility.
     """
     cfg = ExperimentConfig(mode=experiment_mode, val_strategy=val_strategy,
-                           holdout_value=holdout_value, val_ratio=val_ratio, seed=seed)
+                           val_ratio=val_ratio, seed=seed)
 
     logger.info("Loading datasets | mode=%s | val_strategy=%s", cfg.mode, cfg.val_strategy)
 
@@ -611,7 +600,7 @@ def build_datasets(
     # ---- OOD Validation split ------------------------------------------------
     if cfg.val_strategy != "standard_random":
         train_df, val_df = split_ood_validation(
-            train_df, cfg.val_strategy, cfg.holdout_value, cfg.val_ratio, cfg.seed)
+            train_df, cfg.val_strategy, cfg.val_ratio, cfg.seed)
     elif val_df_raw is not None:
         val_df = val_df_raw
         for col in ["language", "generator"]:
@@ -623,7 +612,7 @@ def build_datasets(
     else:
         # No external val file — carve out from train
         train_df, val_df = split_ood_validation(
-            train_df, "standard_random", None, cfg.val_ratio, cfg.seed)
+            train_df, "standard_random", cfg.val_ratio, cfg.seed)
 
     # ---- Stats ---------------------------------------------------------------
     print_dataset_stats("Train", train_df)

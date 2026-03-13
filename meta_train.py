@@ -192,7 +192,6 @@ def main() -> None:
         registry_save_path = args.registry_path,
         experiment_mode    = args.experiment_mode,
         val_strategy       = args.val_strategy,
-        holdout_value      = args.holdout_value,
         seed               = args.seed,
     )
 
