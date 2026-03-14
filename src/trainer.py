@@ -211,6 +211,15 @@ class MetaTrainer:
         self.history_path = os.path.join(self.checkpoint_dir, "history.csv")
         self._init_history()
 
+    def get_current_lambda(self) -> float:
+        if self.global_step < self.eff_warmup_steps:
+            return 0.0
+        return grl_lambda_schedule(
+            self.global_step - self.eff_warmup_steps,
+            max(1, self.total_steps - self.eff_warmup_steps),
+            self.grl_scale
+        )
+
     def _init_history(self) -> None:
         """Initialize history CSV if it doesn't exist."""
         if not os.path.exists(self.history_path):
@@ -291,14 +300,10 @@ class MetaTrainer:
     ) -> Dict[str, float]:
         """One FOMAML meta-training step."""
 
-        # ---- GRL λ schedule (global step based) ----
-        lam = grl_lambda_schedule(self.global_step, self.total_steps, self.grl_scale)
-
         # ---- Smooth Adversarial Warmup: scale weights by lam ----
-        is_warmup = (self.global_step < self.eff_warmup_steps)
-        eff_lam   = 0.0 if is_warmup else lam
-        eff_beta  = 0.0 if is_warmup else self.beta * lam
-        eff_gamma = 0.0 if is_warmup else self.gamma * lam
+        eff_lam = self.get_current_lambda()
+        eff_beta  = self.beta * eff_lam
+        eff_gamma = self.gamma * eff_lam
         self.model.set_lambda(eff_lam)
 
         # ---- Leave-One-Language split ----
@@ -498,7 +503,8 @@ class MetaTrainer:
                     
                     print(
                         f"Epoch {epoch+1} | "
-                        f"step {self.global_step}/{self.total_steps} | "
+                        f"step {step+1}/{len(self.train_loader)} "
+                        f"(glob {self.global_step}/{self.total_steps}) | "
                         f"L={step_log['L_final']:.4f} | "
                         f"label={step_log.get('L_label', 0):.3f} | "
                         f"con={step_log.get('L_contrastive', 0):.3f} | "
@@ -586,7 +592,7 @@ class MetaTrainer:
         import pandas as pd
         lr = self.optimizer.param_groups[0]["lr"]
         # Use stored total_steps for consistent lam in history
-        lam = grl_lambda_schedule(self.global_step, self.total_steps, self.grl_scale)
+        lam = self.get_current_lambda()
         
         row = {"epoch": epoch, "step": self.global_step, "lr": lr, "lam": lam}
         row.update(metrics)

@@ -375,7 +375,8 @@ class CodeDataset(Dataset):
         enc = self.tokenizer(
             code,
             add_special_tokens=False,
-            truncation=False,
+            truncation=True,
+            max_length=100000,
             return_tensors=None,
         )
         ids = enc["input_ids"]
