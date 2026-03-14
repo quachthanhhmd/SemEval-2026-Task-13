@@ -54,6 +54,7 @@ class GraphCodeBERTDomainModel(nn.Module):
         self,
         num_generators: int,
         num_languages:  int,
+        num_domains:    int,
         model_name:     str  = MODEL_NAME,
         dropout:        float = 0.1,
         lam:            float = 1.0,
@@ -99,7 +100,11 @@ class GraphCodeBERTDomainModel(nn.Module):
         self.grl_language = GradientReversalLayer(lam=lam)
         self.language_head = nn.Linear(self.SHARED, num_languages)
 
-        # Head 4: Projection head for SupCon - Uses task_feat
+        # Head 4: Comprehensive Domain adv head (with GRL) - Uses domain_feat
+        self.grl_domain = GradientReversalLayer(lam=lam)
+        self.domain_head = nn.Linear(self.SHARED, num_domains)
+
+        # Head 5: Projection head for SupCon - Uses task_feat
         self.projection_head = nn.Sequential(
             nn.Linear(self.SHARED, self.PROJ_MID),
             nn.GELU(),
@@ -109,8 +114,8 @@ class GraphCodeBERTDomainModel(nn.Module):
 
         self._init_heads()
         logger.info(
-            "GraphCodeBERTDomainModel ready | generators=%d | languages=%d | entropy=True",
-            num_generators, num_languages,
+            "GraphCodeBERTDomainModel ready | generators=%d | languages=%d | domains=%d | entropy=True",
+            num_generators, num_languages, num_domains
         )
 
     # ------------------------------------------------------------------
@@ -119,6 +124,7 @@ class GraphCodeBERTDomainModel(nn.Module):
             self.label_head,
             self.generator_head,
             self.language_head,
+            self.domain_head,
         ]:
             nn.init.xavier_uniform_(module.weight)
             nn.init.zeros_(module.bias)
@@ -143,6 +149,7 @@ class GraphCodeBERTDomainModel(nn.Module):
         """Update GRL lambda (called by trainer according to schedule)."""
         self.grl_generator.set_lambda(lam)
         self.grl_language.set_lambda(lam)
+        self.grl_domain.set_lambda(lam)
 
     # ------------------------------------------------------------------
     def encode(
@@ -216,11 +223,15 @@ class GraphCodeBERTDomainModel(nn.Module):
 
         lang_feat        = self.grl_language(domain_feat)
         language_logits  = self.language_head(lang_feat)     # [B, N_lang]
+        
+        dom_feat         = self.grl_domain(domain_feat)
+        domain_logits    = self.domain_head(dom_feat)        # [B, N_domain]
 
         return {
             "label_logits":     label_logits,
             "generator_logits": generator_logits,
             "language_logits":  language_logits,
+            "domain_logits":    domain_logits,
             "projection":       projection,
             "features_with_entropy": label_input,
         }

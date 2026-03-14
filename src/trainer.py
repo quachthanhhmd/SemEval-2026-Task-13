@@ -155,6 +155,7 @@ class MetaTrainer:
         alpha_meta:     float = 0.3,
         beta:           float = 0.1,
         gamma:          float = 0.1,
+        eta:            float = 0.05,
         delta:          float = 1.0,
         lr_inner:       float = 1e-4,
         grl_scale:      float = 5.0,
@@ -175,6 +176,7 @@ class MetaTrainer:
         self.alpha_meta     = alpha_meta
         self.beta           = beta
         self.gamma          = gamma
+        self.eta            = eta
         self.delta          = delta
         self.lr_inner       = lr_inner
         self.grl_scale      = grl_scale
@@ -257,20 +259,25 @@ class MetaTrainer:
         buffers: Optional[Dict[str, torch.Tensor]] = None,
         beta:   Optional[float] = None,
         gamma:  Optional[float] = None,
+        eta:    Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Full L_train = L_label + α·L_con + β·L_gen + γ·L_lang."""
+        """Full L_train = L_label + α·L_con + β·L_gen + γ·L_lang + η·L_domain."""
         out = self._forward(batch, params, buffers)
         
         total, breakdown = compute_total_loss(
             label_logits     = out["label_logits"],
             generator_logits = out["generator_logits"],
             language_logits  = out["language_logits"],
+            domain_logits    = out["domain_logits"],
             projection       = out["projection"],
             labels           = batch["label"],
             generator_ids    = batch["generator_id"],
             language_ids     = batch["language_id"],
+            domain_ids       = batch["domain_id"],
             supcon_fn        = self.supcon_fn,
-            gamma            = gamma if gamma is not None else self.gamma
+            is_mixed         = batch.get("is_mixed"),
+            gamma            = gamma if gamma is not None else self.gamma,
+            eta              = eta if eta is not None else self.eta
         )
         return total, breakdown
 
@@ -304,6 +311,7 @@ class MetaTrainer:
         eff_lam = self.get_current_lambda()
         eff_beta  = self.beta * eff_lam
         eff_gamma = self.gamma * eff_lam
+        eff_eta   = self.eta * eff_lam
         self.model.set_lambda(eff_lam)
 
         # ---- Leave-One-Language split ----
@@ -355,14 +363,18 @@ class MetaTrainer:
                     label_logits     = out_outer["label_logits"],
                     generator_logits = out_outer["generator_logits"],
                     language_logits  = out_outer["language_logits"],
+                    domain_logits    = out_outer["domain_logits"],
                     projection       = out_outer["projection"],
                     labels           = meta_train_batch["label"],
                     generator_ids    = meta_train_batch["generator_id"],
                     language_ids     = meta_train_batch["language_id"],
+                    domain_ids       = meta_train_batch["domain_id"],
                     supcon_fn        = self.supcon_fn,
+                    is_mixed         = meta_train_batch.get("is_mixed"),
                     alpha            = self.alpha,
                     beta             = eff_beta,
-                    gamma            = eff_gamma
+                    gamma            = eff_gamma,
+                    eta              = eff_eta
                 )
 
             # Meta step
@@ -383,14 +395,18 @@ class MetaTrainer:
                     label_logits     = out["label_logits"],
                     generator_logits = out["generator_logits"],
                     language_logits  = out["language_logits"],
+                    domain_logits    = out["domain_logits"],
                     projection       = out["projection"],
                     labels           = batch["label"],
                     generator_ids    = batch["generator_id"],
                     language_ids     = batch["language_id"],
+                    domain_ids       = batch["domain_id"],
                     supcon_fn        = self.supcon_fn,
+                    is_mixed         = batch.get("is_mixed"),
                     alpha            = self.alpha,
                     beta             = eff_beta,
-                    gamma            = eff_gamma
+                    gamma            = eff_gamma,
+                    eta              = eff_eta
                 )
             L_meta = torch.tensor(0.0, device=self.device)
 
@@ -453,6 +469,7 @@ class MetaTrainer:
                 break
                 
             self.current_epoch = epoch
+            self.epoch_start_time = time.time()
             epoch_logs: Dict[str, float] = defaultdict(float)
 
             if hasattr(self.train_loader.batch_sampler, "set_epoch"):
@@ -488,16 +505,16 @@ class MetaTrainer:
                 if self.global_step % self.log_every == 0:
                     self._log(step_log, prefix="train/step")
                     
-                    # Compute ETA
-                    elapsed = time.time() - self.train_start_time
-                    steps_done = self.global_step
-                    steps_left = self.total_steps - steps_done
+                    # Compute ETA for the CURRENT epoch
+                    elapsed = time.time() - self.epoch_start_time
+                    steps_done = step + 1
+                    steps_left = steps_per_epoch - steps_done
                     sec_per_step = elapsed / max(steps_done, 1)
                     eta_sec = steps_left * sec_per_step
                     
                     # Format ETA
                     if eta_sec > 3600:
-                        eta_str = f"{eta_sec // 3600:.0f}h { (eta_sec % 3600) // 60:.0f}m"
+                        eta_str = f"{eta_sec // 3600:.0f}h {(eta_sec % 3600) // 60:.0f}m"
                     else:
                         eta_str = f"{eta_sec // 60:.0f}m {eta_sec % 60:.0f}s"
                     
@@ -510,6 +527,7 @@ class MetaTrainer:
                         f"con={step_log.get('L_contrastive', 0):.3f} | "
                         f"gen={step_log.get('L_generator', 0):.3f} | "
                         f"lang={step_log.get('L_language', 0):.3f} | "
+                        f"dom={step_log.get('L_domain', 0):.3f} | "
                         f"meta={step_log['L_meta']:.3f} | "
                         f"lam={step_log['grl_lam']:.3f} | "
                         f"ETA {eta_str}"
@@ -520,11 +538,11 @@ class MetaTrainer:
             self._log(avg_log, prefix="train/epoch", step=epoch)
             logger.info(
                 "[Epoch %d] L_total=%.4f  L_label=%.4f  L_con=%.4f  "
-                "L_gen=%.4f  L_lang=%.4f  L_meta=%.4f",
+                "L_gen=%.4f  L_lang=%.4f  L_dom=%.4f  L_meta=%.4f",
                 epoch,
                 avg_log.get("L_total", 0), avg_log.get("L_label", 0),
                 avg_log.get("L_contrastive", 0), avg_log.get("L_generator", 0),
-                avg_log.get("L_language", 0), avg_log.get("L_meta", 0),
+                avg_log.get("L_language", 0), avg_log.get("L_domain", 0), avg_log.get("L_meta", 0),
             )
 
             val_metrics = self.evaluate()

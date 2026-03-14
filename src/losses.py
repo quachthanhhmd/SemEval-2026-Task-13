@@ -156,14 +156,18 @@ def compute_total_loss(
     label_logits:     torch.Tensor,
     generator_logits: torch.Tensor,
     language_logits:  torch.Tensor,
+    domain_logits:    torch.Tensor,
     projection:       torch.Tensor,
     labels:           torch.Tensor,
     generator_ids:    torch.Tensor,
     language_ids:     torch.Tensor,
+    domain_ids:       torch.Tensor,
     supcon_fn:        SupConLoss,
+    is_mixed:         Optional[torch.Tensor] = None,
     alpha: float = 0.5,
     beta:  float = 0.1,
     gamma: float = 0.1,
+    eta:   float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Compute:
@@ -183,12 +187,34 @@ def compute_total_loss(
     L_con = supcon_fn(projection, labels)
 
     # Adversarial losses (GRL already reversed the gradient inside the model)
-    L_gen  = ce(generator_logits, generator_ids) if generator_ids.min() >= 0 else torch.tensor(0.0, device=labels.device)
-    L_lang = ce(language_logits,  language_ids)  if language_ids.min()  >= 0 else torch.tensor(0.0, device=labels.device)
+    # We use nn.CrossEntropyLoss(reduction='none') to selectively mask mixed samples
+    ce_none = nn.CrossEntropyLoss(reduction='none')
+    
+    if generator_ids.min() >= 0:
+        L_gen_all = ce_none(generator_logits, generator_ids)
+        if is_mixed is not None:
+             L_gen_all = L_gen_all * (1.0 - is_mixed)
+        L_gen = L_gen_all.mean()
+    else:
+        L_gen = torch.tensor(0.0, device=labels.device)
+        
+    if language_ids.min() >= 0:
+        L_lang_all = ce_none(language_logits, language_ids)
+        if is_mixed is not None:
+             L_lang_all = L_lang_all * (1.0 - is_mixed)
+        L_lang = L_lang_all.mean()
+    else:
+        L_lang = torch.tensor(0.0, device=labels.device)
+        
+    if domain_ids.min() >= 0:
+        # We do NOT mask L_domain since the domain ID actively reflects if a sample is mixed
+        L_domain = ce_none(domain_logits, domain_ids).mean()
+    else:
+        L_domain = torch.tensor(0.0, device=labels.device)
 
     # Decouple the adversarial loss magnitude from the scale, while keeping the gradient.
     # The trick: add `(adv_loss - adv_loss.detach())`, which equals 0 value but passes gradients.
-    adv_loss = beta * L_gen + gamma * L_lang
+    adv_loss = beta * L_gen + gamma * L_lang + eta * L_domain
     total = L_label + alpha * L_con + (adv_loss - adv_loss.detach())
 
     # For logging, we report the conceptual loss values
@@ -197,6 +223,7 @@ def compute_total_loss(
         "L_contrastive": L_con,
         "L_generator":   L_gen,
         "L_language":    L_lang,
-        "L_total":       L_label + alpha * L_con + beta * L_gen.detach() + gamma * L_lang.detach(),
+        "L_domain":      L_domain,
+        "L_total":       L_label + alpha * L_con + beta * L_gen.detach() + gamma * L_lang.detach() + eta * L_domain.detach(),
     }
     return total, breakdown

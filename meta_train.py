@@ -121,6 +121,8 @@ def parse_args() -> argparse.Namespace:
                    help="Generator adversarial loss weight")
     p.add_argument("--gamma",      type=float, default=0.05,
                    help="Language adversarial loss weight")
+    p.add_argument("--eta",        type=float, default=0.05,
+                   help="Comprehensive domain adversarial loss weight")
     p.add_argument("--delta",      type=float, default=1.0,
                    help="Meta-test loss weight")
     p.add_argument("--grl_scale",  type=float, default=5.0,
@@ -237,6 +239,7 @@ def main() -> None:
     model = GraphCodeBERTDomainModel(
         num_generators = registry.num_generators,
         num_languages  = registry.num_languages,
+        num_domains    = registry.num_domains,
         model_name     = args.model_name,
         dropout        = args.dropout,
     ).to(device)
@@ -303,6 +306,7 @@ def main() -> None:
         alpha_meta     = args.alpha_meta,
         beta           = args.beta,
         gamma          = args.gamma,
+        eta            = args.eta,
         delta          = args.delta,
         lr_inner       = args.lr_inner,
         grl_scale      = args.grl_scale,
