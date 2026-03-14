@@ -20,18 +20,17 @@ from datasets import load_dataset as hf_load_dataset
 
 try:
     from tree_sitter_languages import get_parser
-    TREE_SITTER_PARSERS = {
-        "python":     get_parser("python"),
-        "cpp":        get_parser("cpp"),
-        "java":       get_parser("java"),
-        "go":         get_parser("go"),
-        "javascript": get_parser("javascript"),
-        "php":        get_parser("php"),
-        "c":          get_parser("c"),
-        "c_sharp":    get_parser("c_sharp"),
-    }
+    TREE_SITTER_PARSERS = {}
+    for _ts_lang in ["python", "cpp", "java", "go", "javascript", "php", "c", "c_sharp"]:
+        try:
+            TREE_SITTER_PARSERS[_ts_lang] = get_parser(_ts_lang)
+        except Exception as _e:
+            logger.debug(f"Could not load tree-sitter parser for {_ts_lang}: {_e}")
 except ImportError:
     logger.warning("tree_sitter_languages not found. AST augmentations will be disabled.")
+    TREE_SITTER_PARSERS = {}
+except Exception as e:
+    logger.warning(f"Error initializing tree-sitter-languages: {e}. AST augmentations will be disabled.")
     TREE_SITTER_PARSERS = {}
 
 logger = logging.getLogger(__name__)
