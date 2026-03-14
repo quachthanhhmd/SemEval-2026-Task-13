@@ -18,6 +18,8 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from datasets import load_dataset as hf_load_dataset
 
+logger = logging.getLogger(__name__)
+
 try:
     from tree_sitter_languages import get_parser
     TREE_SITTER_PARSERS = {}
@@ -32,8 +34,6 @@ except ImportError:
 except Exception as e:
     logger.warning(f"Error initializing tree-sitter-languages: {e}. AST augmentations will be disabled.")
     TREE_SITTER_PARSERS = {}
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants and Regex
