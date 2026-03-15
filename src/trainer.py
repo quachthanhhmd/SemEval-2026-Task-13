@@ -656,9 +656,9 @@ class MetaTrainer:
             return 1
             
         logger.info("Resuming from checkpoint: %s", path)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=False))
         
-        state = torch.load(state_path, map_location=self.device)
+        state = torch.load(state_path, map_location=self.device, weights_only=False)
         self.optimizer.load_state_dict(state["optimizer"])
         if self.scheduler and state.get("scheduler"):
             self.scheduler.load_state_dict(state["scheduler"])
