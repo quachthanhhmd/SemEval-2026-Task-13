@@ -273,7 +273,7 @@ def run(args):
 
     # 3. Load model
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = load_model(args.checkpoint_dir, args.model_name, args.num_generators, args.num_languages, device)
+    model = load_model(args.checkpoint_dir, args.model_name, args.num_generators, args.num_languages, args.num_domains, device)
 
     # 4. DataLoader (B*V flattening, same as meta_inference)
     dataset = TTACodeDataset(df, tokenizer, max_length=args.max_len, tta_views=args.tta_views)
@@ -320,6 +320,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name",      type=str, default="microsoft/graphcodebert-base")
     parser.add_argument("--num_generators",  type=int, default=35)
     parser.add_argument("--num_languages",   type=int, default=3)
+    parser.add_argument("--num_domains",     type=int, default=3)
     parser.add_argument("--tta_views",       type=int, default=5)
     parser.add_argument("--max_len",         type=int, default=512)
     parser.add_argument("--batch_size",      type=int, default=16)

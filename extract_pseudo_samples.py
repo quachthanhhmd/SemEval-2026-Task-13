@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Load Model with Robust Weight Handling
 # ---------------------------------------------------------------------------
-def load_model(checkpoint_dir: str, model_name: str, num_generators: int, num_languages: int, device: torch.device):
+def load_model(checkpoint_dir: str, model_name: str, num_generators: int, num_languages: int, num_domains: int, device: torch.device):
     state_dict_path = os.path.join(checkpoint_dir, "model.pt")
     if not os.path.exists(state_dict_path):
         logger.error(f"Cannot find model.pt in {checkpoint_dir}")
@@ -66,6 +66,7 @@ def load_model(checkpoint_dir: str, model_name: str, num_generators: int, num_la
     model = GraphCodeBERTDomainModel(
         num_generators=num_generators,
         num_languages=num_languages,
+        num_domains=num_domains,
         model_name=model_name,
     )
 
@@ -183,7 +184,7 @@ def run_extraction(args):
 
     # 3. Load Model
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = load_model(args.checkpoint_dir, args.model_name, args.num_generators, args.num_languages, device)
+    model = load_model(args.checkpoint_dir, args.model_name, args.num_generators, args.num_languages, args.num_domains, device)
 
     # 4. DataLoader (same as meta_inference)
     dataset = TTACodeDataset(test_df, tokenizer, max_length=args.max_len, tta_views=args.tta_views)
@@ -288,6 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name",      type=str, default="microsoft/graphcodebert-base")
     parser.add_argument("--num_generators",  type=int, default=10)
     parser.add_argument("--num_languages",   type=int, default=10)
+    parser.add_argument("--num_domains",     type=int, default=3)
     parser.add_argument("--max_len",         type=int, default=512)
     parser.add_argument("--batch_size",      type=int, default=16)
     parser.add_argument("--num_workers",     type=int, default=4)
