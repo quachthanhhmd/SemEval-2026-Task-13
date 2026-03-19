@@ -76,7 +76,7 @@ def load_model(checkpoint_dir: str, model_name: str, num_generators: int, num_la
     # Domain heads may have mismatched sizes (trained on different registry) — filter them
     filtered_state_dict = {
         k: v for k, v in state_dict.items()
-        if "generator_head" not in k and "language_head" not in k
+        if "generator_head" not in k and "language_head" not in k and "domain_head" not in k
     }
     missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
     if missing:

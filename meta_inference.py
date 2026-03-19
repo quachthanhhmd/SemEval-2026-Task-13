@@ -189,7 +189,7 @@ def run_inference(args):
     # Filter out domain heads as they might mismatch in size and aren't used for inference
     filtered_state_dict = {
         k: v for k, v in state_dict.items() 
-        if "generator_head" not in k and "language_head" not in k
+        if "generator_head" not in k and "language_head" not in k and "domain_head" not in k
     }
     
     missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
@@ -257,14 +257,25 @@ def run_inference(args):
     test_df['prediction'] = all_final_preds
     test_df['probability_ai'] = all_final_probs
     
-    out_basename = os.path.basename(args.test_file).replace(".parquet", "_tta_preds.csv").replace(".csv", "_tta_preds.csv")
-    out_path = os.path.join(os.path.dirname(args.test_file), out_basename)
+    if args.output_file:
+        out_path = args.output_file
+    else:
+        out_basename = os.path.basename(args.test_file).replace(".parquet", "_tta_preds.csv").replace(".csv", "_tta_preds.csv")
+        out_path = out_basename
     
-    # Only keep essential columns for large test sets
-    logger.info(f"Saving results to {out_path}...")
-    save_cols = [c for c in ['id', 'label', 'prediction', 'probability_ai'] if c in test_df.columns]
-    if not save_cols: save_cols = ['prediction', 'probability_ai']
-    test_df[save_cols].to_csv(out_path, index=False)
+    if 'ID' in test_df.columns:
+        logger.info(f"Formatting for Kaggle submission (id, label)...")
+        submission_df = test_df[['ID', 'prediction']].rename(columns={'prediction': 'label'})
+        submission_df.to_csv(out_path, index=False)
+
+    else:
+        # Default detailed format
+        logger.info(f"Saving detailed results...")
+        save_cols = [c for c in ['ID', 'label', 'prediction', 'probability_ai'] if c in test_df.columns]
+        if not save_cols: save_cols = ['prediction', 'probability_ai']
+        test_df[save_cols].to_csv(out_path, index=False)
+    
+    logger.info(f"Results saved to {out_path}")
     logger.info("Done.")
 
 if __name__ == "__main__":
@@ -281,6 +292,8 @@ if __name__ == "__main__":
     parser.add_argument("--tta_views", type=int, default=5)
     parser.add_argument("--decision_threshold", type=float, default=0.5,
                         help="Probability threshold used to classify AI vs Human")
+    parser.add_argument("--output_file", type=str, default=None,
+                        help="Path to save the output CSV (defaults to current directory)")
     
     args = parser.parse_args()
     run_inference(args)
