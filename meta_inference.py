@@ -179,6 +179,7 @@ def run_inference(args):
     model = GraphCodeBERTDomainModel(
         num_generators = args.num_generators, 
         num_languages  = args.num_languages,
+        num_domains    = args.num_domains,
         model_name     = args.model_name,
     )
     
@@ -188,7 +189,7 @@ def run_inference(args):
     # Filter out domain heads as they might mismatch in size and aren't used for inference
     filtered_state_dict = {
         k: v for k, v in state_dict.items() 
-        if "generator_head" not in k and "language_head" not in k
+        if "generator_head" not in k and "language_head" not in k and "domain_head" not in k
     }
     
     missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
@@ -273,6 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="microsoft/graphcodebert-base")
     parser.add_argument("--num_generators", type=int, default=10)
     parser.add_argument("--num_languages", type=int, default=10)
+    parser.add_argument("--num_domains", type=int, default=3)
     parser.add_argument("--max_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
