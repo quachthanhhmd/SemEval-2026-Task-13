@@ -1,0 +1,16 @@
+code,generator,label,language,agnostic_features
+"(a, b, c, d) = [int(x) for x in input().split()]
+k = input()
+(p, q, r, s) = (0, 0, 0, 0)
+for i in k:
+	if i == '1':
+		p += 1
+	elif i == '2':
+		q += 1
+	elif i == '3':
+		r += 1
+	elif i == '4':
+		s += 1
+print(a * p + b * q + c * r + d * s)
+",human,0,Python,"[ 0.57044834  1.71052632  3.7942331   0.81578947  0.          0.
+  0.         11.91538213  0.44444444  0.          0.        ]"
