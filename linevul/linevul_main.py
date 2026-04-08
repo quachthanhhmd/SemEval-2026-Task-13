@@ -354,6 +354,14 @@ def write_raw_preds_csv(args, y_preds):
         
     os.makedirs("./results", exist_ok=True)
     df.to_csv("./results/raw_preds.csv", index=False)
+    # Submission Format
+    if "ID" in df.columns:
+        submission_df = pd.DataFrame({
+            "ID": df["ID"],
+            "label": [1 if pred else 0 for pred in y_preds]
+        })
+        submission_df.to_csv("./submission.csv", index=False)
+        logger.info("Saved Kaggle submission file to ./submission.csv")
 
 def get_num_lines(func):
     func = func.split("\n")
