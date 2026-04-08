@@ -1,3 +1,0 @@
-Chapters::Display::~Display()
-{
-}
